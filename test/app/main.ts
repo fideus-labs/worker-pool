@@ -37,6 +37,31 @@ function createFailingTask(): WorkerPoolTask<never> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Zarrita-compatible helpers
+// ---------------------------------------------------------------------------
+
+import {
+  ZarrArray,
+  get as zarrGet,
+  set as zarrSet,
+  slice as zarrSlice,
+  range as zarrRange,
+  IndexError,
+  create_queue as createDefaultQueue,
+  workerPoolGetOptions,
+  workerPoolSetOptions,
+} from './zarrita/index.js'
+
+import type {
+  Chunk,
+  DataType,
+  GetOptions,
+  SetOptions,
+  Slice,
+  WorkerPoolQueueOptions,
+} from './zarrita/index.js'
+
 // Expose helpers on the window so Playwright tests can call them.
 declare global {
   interface Window {
@@ -44,6 +69,16 @@ declare global {
     createSquareTask: typeof createSquareTask
     createFailingTask: typeof createFailingTask
     testWorkerUrl: string
+    // Zarrita helpers
+    ZarrArray: typeof ZarrArray
+    zarrGet: typeof zarrGet
+    zarrSet: typeof zarrSet
+    zarrSlice: typeof zarrSlice
+    zarrRange: typeof zarrRange
+    IndexError: typeof IndexError
+    createDefaultQueue: typeof createDefaultQueue
+    workerPoolGetOptions: typeof workerPoolGetOptions
+    workerPoolSetOptions: typeof workerPoolSetOptions
   }
 }
 
@@ -51,3 +86,14 @@ window.WorkerPool = WorkerPool
 window.createSquareTask = createSquareTask
 window.createFailingTask = createFailingTask
 window.testWorkerUrl = testWorkerUrl
+
+// Zarrita
+window.ZarrArray = ZarrArray
+window.zarrGet = zarrGet
+window.zarrSet = zarrSet
+window.zarrSlice = zarrSlice
+window.zarrRange = zarrRange
+window.IndexError = IndexError
+window.createDefaultQueue = createDefaultQueue
+window.workerPoolGetOptions = workerPoolGetOptions
+window.workerPoolSetOptions = workerPoolSetOptions
