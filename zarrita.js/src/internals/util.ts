@@ -150,3 +150,34 @@ export function system_is_little_endian(): boolean {
   const b = new Uint8Array(a.buffer, a.byteOffset, a.byteLength)
   return !(b[0] === 0x12)
 }
+
+// ---------------------------------------------------------------------------
+// SharedArrayBuffer helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Assert that SharedArrayBuffer is available in the current environment.
+ * Throws a descriptive error if not (missing COOP/COEP headers in browsers).
+ */
+export function assertSharedArrayBufferAvailable(): void {
+  if (typeof SharedArrayBuffer === 'undefined') {
+    throw new Error(
+      'SharedArrayBuffer is not available. ' +
+      'In browsers, this requires Cross-Origin-Opener-Policy and ' +
+      'Cross-Origin-Embedder-Policy headers to be set.',
+    )
+  }
+}
+
+/**
+ * Create an ArrayBuffer or SharedArrayBuffer of the given byte length.
+ */
+export function createBuffer(
+  byteLength: number,
+  useShared?: boolean,
+): ArrayBufferLike {
+  if (useShared) {
+    return new SharedArrayBuffer(byteLength)
+  }
+  return new ArrayBuffer(byteLength)
+}

@@ -66,8 +66,49 @@ export interface EncodeResponse {
   bytes: ArrayBuffer
 }
 
-export type WorkerRequest = InitRequest | DecodeRequest | EncodeRequest
-export type WorkerResponse = InitResponse | DecodeResponse | EncodeResponse
+// ---------------------------------------------------------------------------
+// Projection types — plain serializable data describing chunk→output mapping.
+// Mirrors zarrita's Projection type but defined locally for worker messages.
+// ---------------------------------------------------------------------------
+
+/** [start, stop, step] index range. */
+export type Indices = [start: number, stop: number, step: number]
+
+/** Describes how one dimension of a decoded chunk maps into the output array. */
+export type Projection =
+  | { from: null; to: number }       // integer index on source side (dim collapse)
+  | { from: number; to: null }       // integer index on dest side (dim collapse)
+  | { from: Indices; to: Indices }   // slice-to-slice mapping
+
+// ---------------------------------------------------------------------------
+// Decode-into-shared protocol — worker decodes and writes directly into SAB
+// ---------------------------------------------------------------------------
+
+export interface DecodeIntoRequest {
+  type: 'decode_into'
+  id: number
+  /** Raw encoded chunk bytes (transferred one-way to worker). */
+  bytes: ArrayBuffer
+  metaId: number
+  /** The shared output buffer — NOT transferred, shared via structured clone. */
+  output: SharedArrayBuffer
+  /** Total byte length of the output typed array. */
+  outputByteLength: number
+  /** Strides of the output array (in elements, not bytes). */
+  outputStride: number[]
+  /** Mapping from decoded chunk positions to output positions. */
+  projections: Projection[]
+  /** sizeof one element in bytes (e.g. 4 for int32/float32). */
+  bytesPerElement: number
+}
+
+export interface DecodeIntoResponse {
+  type: 'decode_into_ok'
+  id: number
+}
+
+export type WorkerRequest = InitRequest | DecodeRequest | EncodeRequest | DecodeIntoRequest
+export type WorkerResponse = InitResponse | DecodeResponse | EncodeResponse | DecodeIntoResponse
 
 // ---------------------------------------------------------------------------
 // Options for getWorker / setWorker
@@ -83,6 +124,18 @@ export interface GetWorkerOptions<StoreOpts = unknown> {
    * codec-worker bundled with this package.
    */
   workerUrl?: string | URL
+  /**
+   * When true, the returned Chunk's TypedArray is backed by SharedArrayBuffer,
+   * enabling zero-copy sharing with other Web Workers.
+   *
+   * When SharedArrayBuffer is available, codec workers also decode directly
+   * into the shared output buffer, eliminating one ArrayBuffer transfer and
+   * one main-thread copy per chunk.
+   *
+   * Requires Cross-Origin-Opener-Policy and Cross-Origin-Embedder-Policy
+   * headers to be set. Throws if SharedArrayBuffer is not available.
+   */
+  useSharedArrayBuffer?: boolean
 }
 
 export interface SetWorkerOptions {

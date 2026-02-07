@@ -6,20 +6,25 @@
  * (gzip, blosc, zstd, bytes, transpose, etc.).
  *
  * Message protocol:
- *   init:   { type: 'init', id, metaId, meta: CodecChunkMeta }
- *           -> { type: 'init_ok', id }
+ *   init:        { type: 'init', id, metaId, meta: CodecChunkMeta }
+ *                -> { type: 'init_ok', id }
  *
- *   decode: { type: 'decode', id, bytes: ArrayBuffer, metaId }
- *           -> { type: 'decoded', id, data: ArrayBuffer, shape, stride }
+ *   decode:      { type: 'decode', id, bytes: ArrayBuffer, metaId }
+ *                -> { type: 'decoded', id, data: ArrayBuffer, shape, stride }
  *
- *   encode: { type: 'encode', id, data: ArrayBuffer, metaId }
- *           -> { type: 'encoded', id, bytes: ArrayBuffer }
+ *   decode_into: { type: 'decode_into', id, bytes, metaId, output: SAB, ... }
+ *                -> { type: 'decode_into_ok', id }
+ *                Worker decodes and writes directly into SharedArrayBuffer.
+ *
+ *   encode:      { type: 'encode', id, data: ArrayBuffer, metaId }
+ *                -> { type: 'encoded', id, bytes: ArrayBuffer }
  */
 
 import { create_codec_pipeline } from './internals/codec-pipeline.js'
+import { compat_chunk, set_from_chunk_binary } from './internals/setter.js'
 import { get_ctr, get_strides } from './internals/util.js'
 import type { Chunk, DataType } from 'zarrita'
-import type { CodecChunkMeta } from './types.js'
+import type { CodecChunkMeta, Projection } from './types.js'
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope
 
@@ -70,6 +75,7 @@ function getOrCreatePipelineLegacy(meta: CodecChunkMeta) {
 type WorkerMessage =
   | { type: 'init'; id: number; metaId: number; meta: CodecChunkMeta }
   | { type: 'decode'; id: number; bytes: ArrayBuffer; metaId?: number; meta?: CodecChunkMeta }
+  | { type: 'decode_into'; id: number; bytes: ArrayBuffer; metaId: number; output: SharedArrayBuffer; outputByteLength: number; outputStride: number[]; projections: Projection[]; bytesPerElement: number }
   | { type: 'encode'; id: number; data: ArrayBuffer; metaId?: number; meta?: CodecChunkMeta }
 
 ctx.addEventListener('message', async (event: MessageEvent<WorkerMessage>) => {
@@ -126,6 +132,27 @@ ctx.addEventListener('message', async (event: MessageEvent<WorkerMessage>) => {
         },
         [transferBuffer],
       )
+    } else if (msg.type === 'decode_into') {
+      // Decode and write directly into SharedArrayBuffer — no transfer back
+      const pipeline = getPipeline(msg.metaId)
+      const bytes = new Uint8Array(msg.bytes)
+      const chunk = await pipeline.decode(bytes) as Chunk<DataType>
+
+      // Create a Uint8Array view over the shared output buffer
+      const destView = new Uint8Array(msg.output, 0, msg.outputByteLength)
+
+      // Convert decoded chunk to byte-level representation
+      const src = compat_chunk(chunk)
+
+      // Write decoded data directly into the shared output memory
+      set_from_chunk_binary(
+        { data: destView, stride: msg.outputStride },
+        src,
+        msg.bytesPerElement,
+        msg.projections,
+      )
+
+      ctx.postMessage({ type: 'decode_into_ok', id: msg.id })
     } else if (msg.type === 'encode') {
       // Resolve pipeline and meta
       let pipeline: ReturnType<typeof create_codec_pipeline>
@@ -172,7 +199,7 @@ ctx.addEventListener('message', async (event: MessageEvent<WorkerMessage>) => {
   } catch (error) {
     // Send error back to main thread
     ctx.postMessage({
-      type: msg.type === 'decode' ? 'decoded' : msg.type === 'encode' ? 'encoded' : 'init_ok',
+      type: msg.type === 'decode' ? 'decoded' : msg.type === 'encode' ? 'encoded' : msg.type === 'decode_into' ? 'decode_into_ok' : 'init_ok',
       id: msg.id,
       error: error instanceof Error ? error.message : String(error),
     })

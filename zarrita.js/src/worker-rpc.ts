@@ -9,7 +9,7 @@
 
 import type { Chunk, DataType, TypedArray } from 'zarrita'
 import { get_ctr } from './internals/util.js'
-import type { CodecChunkMeta } from './types.js'
+import type { CodecChunkMeta, Projection } from './types.js'
 
 // ---------------------------------------------------------------------------
 // Persistent message dispatcher
@@ -245,4 +245,61 @@ export async function workerEncode<D extends DataType>(
   ) as { bytes: ArrayBuffer }
 
   return new Uint8Array(response.bytes)
+}
+
+// ---------------------------------------------------------------------------
+// workerDecodeInto — decode and write directly into SharedArrayBuffer
+// ---------------------------------------------------------------------------
+
+/**
+ * Send raw bytes to a codec worker for decoding, with the worker writing
+ * the decoded data directly into a SharedArrayBuffer output.
+ *
+ * This eliminates the transfer-back step and the main-thread copy — the
+ * worker decodes the chunk, then runs setter.set_from_chunk to write
+ * directly into the shared output memory.
+ *
+ * Only usable when the output is backed by SharedArrayBuffer.
+ */
+export async function workerDecodeInto(
+  worker: Worker,
+  bytes: Uint8Array,
+  metaId: number,
+  meta: CodecChunkMeta,
+  output: SharedArrayBuffer,
+  outputByteLength: number,
+  outputStride: number[],
+  projections: Projection[],
+  bytesPerElement: number,
+): Promise<void> {
+  const dispatcher = getDispatcher(worker)
+  await ensureMeta(dispatcher, metaId)
+
+  const id = nextRequestId++
+  // Always copy: store-fetched bytes may be cached/shared
+  const transferBuffer = prepareTransferBuffer(
+    bytes.buffer,
+    bytes.byteOffset,
+    bytes.byteLength,
+    false,
+  )
+
+  // SharedArrayBuffer goes in the message but NOT in the transfer list.
+  // postMessage shares SABs via structured clone automatically.
+  // Only the raw bytes ArrayBuffer is transferred (one-way, neutered on main thread).
+  await dispatcher.send(
+    id,
+    {
+      type: 'decode_into' as const,
+      id,
+      bytes: transferBuffer,
+      metaId,
+      output,
+      outputByteLength,
+      outputStride,
+      projections,
+      bytesPerElement,
+    },
+    [transferBuffer],
+  )
 }

@@ -20,9 +20,15 @@ import type {
 } from 'zarrita'
 import { BasicIndexer } from './internals/indexer.js'
 import { setter } from './internals/setter.js'
-import { get_ctr, get_strides, create_chunk_key_encoder } from './internals/util.js'
+import {
+  get_ctr,
+  get_strides,
+  create_chunk_key_encoder,
+  assertSharedArrayBufferAvailable,
+  createBuffer,
+} from './internals/util.js'
 import type { GetWorkerOptions, CodecChunkMeta } from './types.js'
-import { workerDecode, getMetaId } from './worker-rpc.js'
+import { workerDecode, workerDecodeInto, getMetaId } from './worker-rpc.js'
 
 /**
  * Default URL for the codec worker. Uses `import.meta.url` to resolve
@@ -153,6 +159,11 @@ export async function getWorker<
 > {
   const { pool, workerUrl } = opts
   const resolvedWorkerUrl = workerUrl ?? DEFAULT_WORKER_URL
+  const useShared = !!opts.useSharedArrayBuffer
+
+  if (useShared) {
+    assertSharedArrayBufferAvailable()
+  }
 
   // Read metadata from store — single read, single parse
   const { codecMeta, encodeChunkKey, fillValue } = await readArrayMetadata(arr)
@@ -161,6 +172,7 @@ export async function getWorker<
   const metaId = getMetaId(codecMeta)
 
   const Ctr = get_ctr(arr.dtype)
+  const bytesPerElement = (Ctr as unknown as { BYTES_PER_ELEMENT: number }).BYTES_PER_ELEMENT
 
   // Set up the indexer
   const indexer = new BasicIndexer({
@@ -169,9 +181,10 @@ export async function getWorker<
     chunk_shape: arr.chunks,
   })
 
-  // Allocate output
+  // Allocate output — backed by SharedArrayBuffer when requested
   const size = indexer.shape.reduce((a: number, b: number) => a * b, 1)
-  const data = new Ctr(size)
+  const buffer = createBuffer(size * bytesPerElement, useShared)
+  const data = new Ctr(buffer as ArrayBuffer, 0, size)
   const outStride = get_strides(indexer.shape)
   const out = setter.prepare(data, indexer.shape, outStride) as Chunk<D>
 
@@ -193,8 +206,6 @@ export async function getWorker<
       // Fetch raw bytes from store on main thread
       const rawBytes = await arr.store.get(chunkPath, opts.opts)
 
-      let chunk: Chunk<D>
-
       if (!rawBytes) {
         // Missing chunk — fill value, no worker needed
         const chunkData = new Ctr(chunkSize)
@@ -202,24 +213,44 @@ export async function getWorker<
           // @ts-expect-error: fill_value type is union
           chunkData.fill(fillValue)
         }
-        chunk = {
+        const chunk: Chunk<D> = {
           data: chunkData as Chunk<D>['data'],
           shape: chunkShape.slice(),
           stride: chunkStrides.slice(),
         }
-      } else {
-        // Decode on worker
+        // Copy fill-value chunk into output on main thread
+        setter.set_from_chunk(out, chunk, mapping)
+      } else if (useShared) {
+        // Decode-into-shared: worker decodes AND writes directly into
+        // the SharedArrayBuffer output — no transfer back, no main-thread copy
         try {
-          chunk = await workerDecode<D>(worker, rawBytes, metaId, codecMeta)
+          await workerDecodeInto(
+            worker,
+            rawBytes,
+            metaId,
+            codecMeta,
+            buffer as SharedArrayBuffer,
+            size * bytesPerElement,
+            outStride,
+            mapping,
+            bytesPerElement,
+          )
         } catch (error) {
-          // Don't return broken workers to the pool
           worker.terminate()
           throw error
         }
+      } else {
+        // Standard path: worker decodes, transfers back, main thread copies
+        let chunk: Chunk<D>
+        try {
+          chunk = await workerDecode<D>(worker, rawBytes, metaId, codecMeta)
+        } catch (error) {
+          worker.terminate()
+          throw error
+        }
+        setter.set_from_chunk(out, chunk, mapping)
       }
 
-      // Copy decoded chunk into output on main thread
-      setter.set_from_chunk(out, chunk, mapping)
       return { worker, result: undefined as void }
     })
   }

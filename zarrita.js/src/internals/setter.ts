@@ -21,7 +21,7 @@ function indices_len(start: number, stop: number, step: number): number {
   return 0
 }
 
-function compat_chunk<D extends DataType>(
+export function compat_chunk<D extends DataType>(
   arr: Chunk<D>,
 ): {
   data: Uint8Array
@@ -30,7 +30,7 @@ function compat_chunk<D extends DataType>(
 } {
   return {
     data: new Uint8Array(
-      (arr.data as unknown as { buffer: ArrayBuffer }).buffer,
+      (arr.data as unknown as { buffer: ArrayBufferLike }).buffer,
       (arr.data as unknown as { byteOffset: number }).byteOffset,
       (arr.data as unknown as { byteLength: number }).byteLength,
     ),
@@ -89,7 +89,7 @@ function set_scalar_binary(
 // set_from_chunk_binary
 // ---------------------------------------------------------------------------
 
-function set_from_chunk_binary(
+export function set_from_chunk_binary(
   dest: { data: Uint8Array; stride: number[] },
   src: { data: Uint8Array; stride: number[] },
   bytes_per_element: number,

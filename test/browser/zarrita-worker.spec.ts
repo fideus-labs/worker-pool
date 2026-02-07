@@ -573,4 +573,321 @@ test.describe('@fideus-labs/zarrita.js — getWorker / setWorker', () => {
     expect(result.workerData).toEqual(result.builtinData)
   })
 
+  // -------------------------------------------------------------------------
+  // SharedArrayBuffer support
+  // -------------------------------------------------------------------------
+
+  test('getWorker with useSharedArrayBuffer returns SharedArrayBuffer-backed output', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [4, 4],
+        chunk_shape: [2, 2],
+        data_type: 'int32',
+      })
+
+      // Write data
+      const data = new Int32Array(16)
+      for (let i = 0; i < 16; i++) data[i] = i + 1
+      await zarr.set(arr, null, { data, shape: [4, 4], stride: [4, 1] })
+
+      // Read with SharedArrayBuffer
+      const chunk = await getWorker(arr, null, { pool, useSharedArrayBuffer: true })
+      pool.terminateWorkers()
+
+      return {
+        data: Array.from(chunk.data as Int32Array),
+        shape: chunk.shape,
+        isShared: chunk.data.buffer instanceof SharedArrayBuffer,
+      }
+    })
+
+    expect(result.isShared).toBe(true)
+    expect(result.shape).toEqual([4, 4])
+    expect(result.data).toEqual(Array.from({ length: 16 }, (_, i) => i + 1))
+  })
+
+  test('getWorker without useSharedArrayBuffer returns regular ArrayBuffer', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [4],
+        chunk_shape: [4],
+        data_type: 'int32',
+      })
+
+      await zarr.set(arr, null, {
+        data: new Int32Array([1, 2, 3, 4]),
+        shape: [4],
+        stride: [1],
+      })
+
+      const chunk = await getWorker(arr, null, { pool })
+      pool.terminateWorkers()
+
+      return {
+        data: Array.from(chunk.data as Int32Array),
+        isShared: chunk.data.buffer instanceof SharedArrayBuffer,
+      }
+    })
+
+    expect(result.isShared).toBe(false)
+    expect(result.data).toEqual([1, 2, 3, 4])
+  })
+
+  test('getWorker with useSharedArrayBuffer works with slicing', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [10],
+        chunk_shape: [5],
+        data_type: 'int32',
+      })
+
+      const data = new Int32Array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
+      await zarr.set(arr, null, { data, shape: [10], stride: [1] })
+
+      // Read a slice [2:7] with SAB
+      const chunk = await getWorker(arr, [zarr.slice(2, 7)], {
+        pool,
+        useSharedArrayBuffer: true,
+      })
+      pool.terminateWorkers()
+
+      return {
+        data: Array.from(chunk.data as Int32Array),
+        shape: chunk.shape,
+        isShared: chunk.data.buffer instanceof SharedArrayBuffer,
+      }
+    })
+
+    expect(result.isShared).toBe(true)
+    expect(result.shape).toEqual([5])
+    expect(result.data).toEqual([2, 3, 4, 5, 6])
+  })
+
+  test('getWorker with useSharedArrayBuffer handles fill-value chunks', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [6],
+        chunk_shape: [3],
+        data_type: 'int32',
+        fill_value: -1,
+      })
+
+      // Only write to the first chunk
+      await zarr.set(arr, [zarr.slice(0, 3)], {
+        data: new Int32Array([10, 20, 30]),
+        shape: [3],
+        stride: [1],
+      })
+
+      // Read full array — second chunk should be fill value
+      const chunk = await getWorker(arr, null, {
+        pool,
+        useSharedArrayBuffer: true,
+      })
+      pool.terminateWorkers()
+
+      return {
+        data: Array.from(chunk.data as Int32Array),
+        isShared: chunk.data.buffer instanceof SharedArrayBuffer,
+      }
+    })
+
+    expect(result.isShared).toBe(true)
+    expect(result.data).toEqual([10, 20, 30, -1, -1, -1])
+  })
+
+  test('getWorker with useSharedArrayBuffer matches non-SAB results', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [8, 8],
+        chunk_shape: [4, 4],
+        data_type: 'float32',
+      })
+
+      const data = new Float32Array(64)
+      for (let i = 0; i < 64; i++) data[i] = i * 1.5
+      await zarr.set(arr, null, { data, shape: [8, 8], stride: [8, 1] })
+
+      // Read without SAB
+      const normalResult = await getWorker(arr, null, { pool })
+
+      // Read with SAB
+      const sabResult = await getWorker(arr, null, {
+        pool,
+        useSharedArrayBuffer: true,
+      })
+      pool.terminateWorkers()
+
+      return {
+        normalData: Array.from(normalResult.data as Float32Array),
+        sabData: Array.from(sabResult.data as Float32Array),
+        normalIsShared: normalResult.data.buffer instanceof SharedArrayBuffer,
+        sabIsShared: sabResult.data.buffer instanceof SharedArrayBuffer,
+      }
+    })
+
+    expect(result.normalIsShared).toBe(false)
+    expect(result.sabIsShared).toBe(true)
+    expect(result.sabData).toEqual(result.normalData)
+  })
+
+  test('getWorker with useSharedArrayBuffer: 3D multi-chunk array', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(4)
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [4, 4, 4],
+        chunk_shape: [2, 2, 2],
+        data_type: 'float32',
+      })
+
+      // Fill with sequential values
+      const data = new Float32Array(64)
+      for (let i = 0; i < 64; i++) data[i] = i
+      await zarr.set(arr, null, { data, shape: [4, 4, 4], stride: [16, 4, 1] })
+
+      // Read with SAB — 8 chunks decoded by workers into shared memory
+      const sabChunk = await getWorker(arr, null, {
+        pool,
+        useSharedArrayBuffer: true,
+      })
+
+      // Read with built-in zarr.get for comparison
+      const builtinChunk = await zarr.get(arr, null)
+
+      pool.terminateWorkers()
+
+      return {
+        match: Array.from(sabChunk.data as Float32Array).every(
+          (v, i) => v === (builtinChunk.data as Float32Array)[i]
+        ),
+        shape: sabChunk.shape,
+        length: (sabChunk.data as Float32Array).length,
+        isShared: sabChunk.data.buffer instanceof SharedArrayBuffer,
+      }
+    })
+
+    expect(result.match).toBe(true)
+    expect(result.shape).toEqual([4, 4, 4])
+    expect(result.length).toBe(64)
+    expect(result.isShared).toBe(true)
+  })
+
+  test('getWorker with useSharedArrayBuffer: gzip-compressed chunks', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [4],
+        chunk_shape: [4],
+        data_type: 'int32',
+        codecs: [
+          { name: 'bytes', configuration: { endian: 'little' } },
+          { name: 'gzip', configuration: { level: 1 } },
+        ],
+      })
+
+      // Manually gzip-compress and write raw chunk bytes
+      const data = new Int32Array([100, 200, 300, 400])
+      const rawBytes = new Uint8Array(data.buffer)
+      const compressedStream = new Response(rawBytes).body!
+        .pipeThrough(new CompressionStream('gzip'))
+      const compressedBytes = new Uint8Array(
+        await new Response(compressedStream).arrayBuffer()
+      )
+
+      const mapStore = arr.store as unknown as { set(k: string, v: Uint8Array): void }
+      mapStore.set('/c/0', compressedBytes)
+
+      // Read using getWorker with SAB
+      const chunk = await getWorker(arr, null, {
+        pool,
+        useSharedArrayBuffer: true,
+      })
+      pool.terminateWorkers()
+
+      return {
+        data: Array.from(chunk.data as Int32Array),
+        isShared: chunk.data.buffer instanceof SharedArrayBuffer,
+      }
+    })
+
+    expect(result.data).toEqual([100, 200, 300, 400])
+    expect(result.isShared).toBe(true)
+  })
+
+  test('getWorker with useSharedArrayBuffer: multiple data types', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+      const results: { dtype: string; data: number[]; isShared: boolean }[] = []
+
+      for (const [dtype, TypedArr, vals] of [
+        ['uint8', Uint8Array, [1, 2, 255]] as const,
+        ['uint16', Uint16Array, [100, 200, 65535]] as const,
+        ['float64', Float64Array, [1.1, 2.2, 3.3]] as const,
+      ]) {
+        const store = zarr.root()
+        const arr = await zarr.create(store, {
+          shape: [3],
+          chunk_shape: [3],
+          data_type: dtype,
+        })
+
+        await zarr.set(arr, null, {
+          data: new TypedArr(vals),
+          shape: [3],
+          stride: [1],
+        })
+
+        const chunk = await getWorker(arr, null, {
+          pool,
+          useSharedArrayBuffer: true,
+        })
+
+        results.push({
+          dtype,
+          data: Array.from(chunk.data as unknown as ArrayLike<number>),
+          isShared: chunk.data.buffer instanceof SharedArrayBuffer,
+        })
+      }
+
+      pool.terminateWorkers()
+      return results
+    })
+
+    for (const r of result) {
+      expect(r.isShared).toBe(true)
+    }
+    expect(result[0].data).toEqual([1, 2, 255])
+    expect(result[1].data).toEqual([100, 200, 65535])
+    expect(result[2].data[0]).toBeCloseTo(1.1, 10)
+    expect(result[2].data[1]).toBeCloseTo(2.2, 10)
+    expect(result[2].data[2]).toBeCloseTo(3.3, 10)
+  })
+
 })
