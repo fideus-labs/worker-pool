@@ -840,6 +840,143 @@ test.describe('@fideus-labs/zarrita.js — getWorker / setWorker', () => {
     expect(result.isShared).toBe(true)
   })
 
+  // -------------------------------------------------------------------------
+  // setWorker with SharedArrayBuffer support
+  // -------------------------------------------------------------------------
+
+  test('setWorker with useSharedArrayBuffer: full array write', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, setWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [6],
+        chunk_shape: [3],
+        data_type: 'float32',
+      })
+
+      // Write using setWorker with SAB
+      const data = new Float32Array([10, 20, 30, 40, 50, 60])
+      await setWorker(arr, null, {
+        data,
+        shape: [6],
+        stride: [1],
+      }, { pool, useSharedArrayBuffer: true })
+
+      // Read back using zarr.get (built-in) to verify
+      const chunk = await zarr.get(arr, null)
+      pool.terminateWorkers()
+
+      return Array.from(chunk.data as Float32Array)
+    })
+
+    expect(result).toEqual([10, 20, 30, 40, 50, 60])
+  })
+
+  test('setWorker with useSharedArrayBuffer: partial chunk update', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, setWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [6],
+        chunk_shape: [3],
+        data_type: 'int32',
+      })
+
+      // Fill with 1s using regular setWorker
+      await setWorker(arr, null, 1, { pool })
+
+      // Partially update [1:4] = 99 using SAB path
+      await setWorker(arr, [zarr.slice(1, 4)], 99, { pool, useSharedArrayBuffer: true })
+
+      // Read full array
+      const chunk = await getWorker(arr, null, { pool })
+      pool.terminateWorkers()
+
+      return Array.from(chunk.data as Int32Array)
+    })
+
+    expect(result).toEqual([1, 99, 99, 99, 1, 1])
+  })
+
+  test('setWorker with useSharedArrayBuffer: scalar value', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, setWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [3, 3],
+        chunk_shape: [3, 3],
+        data_type: 'float64',
+      })
+
+      // Set all elements to 42.0 with SAB
+      await setWorker(arr, null, 42.0, { pool, useSharedArrayBuffer: true })
+
+      // Read back
+      const chunk = await getWorker(arr, null, { pool })
+      pool.terminateWorkers()
+
+      return Array.from(chunk.data as Float64Array)
+    })
+
+    expect(result).toEqual([42, 42, 42, 42, 42, 42, 42, 42, 42])
+  })
+
+  test('setWorker with useSharedArrayBuffer matches non-SAB results', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, setWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+
+      // Write same data with and without SAB, compare
+      const data = new Float32Array(16)
+      for (let i = 0; i < 16; i++) data[i] = i * 2.5
+
+      // Without SAB
+      const store1 = zarr.root()
+      const arr1 = await zarr.create(store1, {
+        shape: [4, 4],
+        chunk_shape: [2, 2],
+        data_type: 'float32',
+      })
+      await setWorker(arr1, null, {
+        data: new Float32Array(data),
+        shape: [4, 4],
+        stride: [4, 1],
+      }, { pool })
+
+      // With SAB
+      const store2 = zarr.root()
+      const arr2 = await zarr.create(store2, {
+        shape: [4, 4],
+        chunk_shape: [2, 2],
+        data_type: 'float32',
+      })
+      await setWorker(arr2, null, {
+        data: new Float32Array(data),
+        shape: [4, 4],
+        stride: [4, 1],
+      }, { pool, useSharedArrayBuffer: true })
+
+      // Read both back with zarr.get
+      const result1 = await zarr.get(arr1, null)
+      const result2 = await zarr.get(arr2, null)
+
+      pool.terminateWorkers()
+
+      return {
+        normalData: Array.from(result1.data as Float32Array),
+        sabData: Array.from(result2.data as Float32Array),
+      }
+    })
+
+    expect(result.sabData).toEqual(result.normalData)
+  })
+
   test('getWorker with useSharedArrayBuffer: multiple data types', async ({ page }) => {
     const result = await page.evaluate(async () => {
       const { zarr, getWorker, WorkerPool } = window

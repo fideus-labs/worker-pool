@@ -26,8 +26,8 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
-      - name: Build
-        run: pnpm build
+      - name: Typecheck
+        run: pnpm -r build
 
       - name: Install Playwright browsers
         run: pnpm exec playwright install --with-deps chromium

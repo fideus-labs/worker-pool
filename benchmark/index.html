@@ -73,6 +73,10 @@
           Pool size
           <input type="number" id="pool-size" min="1" max="128" />
         </label>
+        <div class="checkbox-group" style="margin-top: 10px">
+          <label><input type="checkbox" id="opt-sab" checked /> Use SharedArrayBuffer</label>
+        </div>
+        <p class="hint">Adds a "Worker + SAB" variant using decode-into-shared optimization.</p>
       </fieldset>
 
       <!-- Iterations -->
@@ -127,11 +131,12 @@
       <!-- Results table -->
       <div id="table-container" class="table-container hidden">
         <table id="results-table">
-          <thead>
+          <thead id="results-head">
             <tr>
               <th>Operation</th>
               <th>Vanilla (ms)</th>
               <th>Worker (ms)</th>
+              <th>Worker+SAB (ms)</th>
               <th>Speedup</th>
             </tr>
           </thead>

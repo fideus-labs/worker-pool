@@ -183,7 +183,7 @@ export async function workerDecode<D extends DataType>(
   const id = nextRequestId++
   // Always copy: store-fetched bytes may be cached/shared
   const transferBuffer = prepareTransferBuffer(
-    bytes.buffer,
+    bytes.buffer as ArrayBuffer,
     bytes.byteOffset,
     bytes.byteLength,
     false,
@@ -248,6 +248,48 @@ export async function workerEncode<D extends DataType>(
 }
 
 // ---------------------------------------------------------------------------
+// workerEncodeShared — encode from SharedArrayBuffer (no transfer needed)
+// ---------------------------------------------------------------------------
+
+/**
+ * Send chunk data on a SharedArrayBuffer to a codec worker for encoding.
+ *
+ * Unlike `workerEncode`, this does NOT transfer the data buffer (SABs cannot
+ * be transferred). The worker reads directly from shared memory. The encoded
+ * result is still transferred back as a regular ArrayBuffer.
+ */
+export async function workerEncodeShared<D extends DataType>(
+  worker: Worker,
+  data: TypedArray<D>,
+  metaId: number,
+  meta: CodecChunkMeta,
+): Promise<Uint8Array> {
+  const dispatcher = getDispatcher(worker)
+  await ensureMeta(dispatcher, metaId)
+
+  const id = nextRequestId++
+  const view = data as unknown as {
+    buffer: ArrayBufferLike
+    byteOffset: number
+    byteLength: number
+  }
+  // Copy out of SAB into a regular ArrayBuffer for transfer.
+  // SharedArrayBuffer.slice() returns another SAB, so we must manually copy.
+  const copy = new ArrayBuffer(view.byteLength)
+  new Uint8Array(copy).set(
+    new Uint8Array(view.buffer as ArrayBuffer, view.byteOffset, view.byteLength),
+  )
+
+  const response = await dispatcher.send(
+    id,
+    { type: 'encode', id, data: copy, metaId },
+    [copy],
+  ) as { bytes: ArrayBuffer }
+
+  return new Uint8Array(response.bytes)
+}
+
+// ---------------------------------------------------------------------------
 // workerDecodeInto — decode and write directly into SharedArrayBuffer
 // ---------------------------------------------------------------------------
 
@@ -278,7 +320,7 @@ export async function workerDecodeInto(
   const id = nextRequestId++
   // Always copy: store-fetched bytes may be cached/shared
   const transferBuffer = prepareTransferBuffer(
-    bytes.buffer,
+    bytes.buffer as ArrayBuffer,
     bytes.byteOffset,
     bytes.byteLength,
     false,

@@ -3,7 +3,7 @@
  *
  * Provides `getWorker` and `setWorker` as drop-in replacements for zarrita's
  * `get` and `set` that offload codec encode/decode to Web Workers via a
- * WorkerPool, with p-queue controlling request concurrency.
+ * WorkerPool with bounded concurrency.
  */
 
 export { getWorker } from './get-worker.js'

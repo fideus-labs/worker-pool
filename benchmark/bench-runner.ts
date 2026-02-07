@@ -98,7 +98,8 @@ export async function runBenchmark(
 
   // Determine total steps for progress tracking
   const totalOps = config.operations.length
-  const totalStepsPerOp = (config.warmupRuns + config.iterations) * 2 // *2 for vanilla+worker
+  const variantsPerOp = config.useSharedArrayBuffer ? 3 : 2 // vanilla+worker [+worker-sab]
+  const totalStepsPerOp = (config.warmupRuns + config.iterations) * variantsPerOp
   const totalSteps = totalOps * totalStepsPerOp
   let currentStep = 0
 
@@ -205,6 +206,34 @@ export async function runBenchmark(
         variant: 'worker',
         stats: computeStats(workerTimes),
       })
+
+      // --- Worker + SharedArrayBuffer read ---
+      if (config.useSharedArrayBuffer) {
+        const sabTimes: number[] = []
+
+        // Warmup
+        for (let i = 0; i < config.warmupRuns; i++) {
+          checkAbort()
+          await getWorker(readArr, null, { pool, workerUrl, useSharedArrayBuffer: true })
+          report('warmup', 'read', 'worker-sab', i + 1, config.warmupRuns)
+        }
+
+        // Timed
+        for (let i = 0; i < config.iterations; i++) {
+          checkAbort()
+          const ms = await timeAsync(() =>
+            getWorker(readArr, null, { pool, workerUrl, useSharedArrayBuffer: true }).then(() => {}),
+          )
+          sabTimes.push(ms)
+          report('benchmark', 'read', 'worker-sab', i + 1, config.iterations)
+        }
+
+        results.push({
+          operation: 'read',
+          variant: 'worker-sab',
+          stats: computeStats(sabTimes),
+        })
+      }
     }
 
     if (op === 'write' && writeArr && writeRefData && writeStrides) {

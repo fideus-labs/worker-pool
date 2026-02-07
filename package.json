@@ -1,7 +1,7 @@
 {
   "name": "@fideus-labs/worker-pool",
   "version": "0.1.0",
-  "description": "A web worker pool with a ChunkQueue-compatible interface, ported from itk-wasm's WebWorkerPool.",
+  "description": "A Web Worker pool with bounded concurrency. ChunkQueue-compatible add/onIdle and batch runTasks/cancel interfaces.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

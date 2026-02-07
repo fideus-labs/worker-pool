@@ -53,6 +53,11 @@ export interface BenchmarkConfig {
   iterations: number
   warmupRuns: number
   operations: BenchmarkOperation[]
+  /**
+   * When true, include a "Worker + SAB" variant that uses SharedArrayBuffer
+   * for the output buffer, enabling the decode-into-shared optimization.
+   */
+  useSharedArrayBuffer: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -70,7 +75,7 @@ export interface TimingStats {
 
 export interface OperationResult {
   operation: BenchmarkOperation
-  variant: 'vanilla' | 'worker'
+  variant: 'vanilla' | 'worker' | 'worker-sab'
   stats: TimingStats
 }
 
@@ -87,7 +92,7 @@ export interface BenchmarkResult {
 export interface BenchmarkProgress {
   phase: 'warmup' | 'benchmark'
   operation: BenchmarkOperation
-  variant: 'vanilla' | 'worker'
+  variant: 'vanilla' | 'worker' | 'worker-sab'
   iteration: number
   totalIterations: number
   /** Overall progress 0..1 */

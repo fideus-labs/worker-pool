@@ -9,11 +9,16 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./codec-worker": {
+      "types": "./dist/codec-worker.d.ts",
+      "import": "./dist/codec-worker.js"
     }
   },
   "files": [
     "dist",
-    "src"
+    "src",
+    "LICENSE.txt"
   ],
   "sideEffects": false,
   "scripts": {

@@ -23,9 +23,15 @@ import type {
 } from 'zarrita'
 import { BasicIndexer, type IndexerProjection } from './internals/indexer.js'
 import { setter } from './internals/setter.js'
-import { get_ctr, get_strides, create_chunk_key_encoder } from './internals/util.js'
+import {
+  get_ctr,
+  get_strides,
+  create_chunk_key_encoder,
+  assertSharedArrayBufferAvailable,
+  createBuffer,
+} from './internals/util.js'
 import type { SetWorkerOptions, CodecChunkMeta } from './types.js'
-import { workerDecode, workerEncode, getMetaId } from './worker-rpc.js'
+import { workerDecode, workerEncode, workerEncodeShared, getMetaId } from './worker-rpc.js'
 
 /**
  * Default URL for the codec worker.
@@ -172,6 +178,11 @@ export async function setWorker<D extends DataType>(
 ): Promise<void> {
   const { pool, workerUrl } = opts
   const resolvedWorkerUrl = workerUrl ?? DEFAULT_WORKER_URL
+  const useShared = !!opts.useSharedArrayBuffer
+
+  if (useShared) {
+    assertSharedArrayBufferAvailable()
+  }
 
   // Read metadata from store — single read, single parse
   const { codecMeta, encodeChunkKey, fillValue } = await readArrayMetadata(arr)
@@ -180,6 +191,7 @@ export async function setWorker<D extends DataType>(
   const metaId = getMetaId(codecMeta)
 
   const Ctr = get_ctr(arr.dtype)
+  const bytesPerElement = (Ctr as unknown as { BYTES_PER_ELEMENT: number }).BYTES_PER_ELEMENT
 
   // Set up the indexer
   const indexer = new BasicIndexer({
@@ -209,7 +221,9 @@ export async function setWorker<D extends DataType>(
 
       if (is_total_slice(chunkSelection, chunkShape)) {
         // Totally replace this chunk — no need to fetch existing data
-        chunkData = new Ctr(chunkSize) as TypedArray<D>
+        // Use SAB when requested so the encode worker can read without transfer
+        const buffer = createBuffer(chunkSize * bytesPerElement, useShared)
+        chunkData = new Ctr(buffer as ArrayBuffer, 0, chunkSize) as TypedArray<D>
         if (typeof value === 'object' && value !== null) {
           const chunk = setter.prepare(chunkData, chunkShape.slice(), chunkStrides.slice()) as Chunk<D>
           setter.set_from_chunk(
@@ -229,14 +243,26 @@ export async function setWorker<D extends DataType>(
           // Decode existing chunk on worker
           try {
             const decoded = await workerDecode<D>(worker, rawBytes, metaId, codecMeta)
-            chunkData = decoded.data
+            if (useShared) {
+              // Copy decoded data into a SAB-backed buffer for zero-transfer encode
+              const buffer = createBuffer(
+                chunkSize * bytesPerElement,
+                true,
+              ) as SharedArrayBuffer
+              const sabData = new Ctr(buffer as unknown as ArrayBuffer, 0, chunkSize) as TypedArray<D>
+              ;(sabData as unknown as { set(src: unknown): void }).set(decoded.data)
+              chunkData = sabData
+            } else {
+              chunkData = decoded.data
+            }
           } catch (error) {
             worker.terminate()
             throw error
           }
         } else {
           // Missing chunk — start from fill value
-          chunkData = new Ctr(chunkSize) as TypedArray<D>
+          const buffer = createBuffer(chunkSize * bytesPerElement, useShared)
+          chunkData = new Ctr(buffer as ArrayBuffer, 0, chunkSize) as TypedArray<D>
           if (fillValue != null) {
             // @ts-expect-error: fill_value union
             chunkData.fill(fillValue)
@@ -257,7 +283,8 @@ export async function setWorker<D extends DataType>(
 
       // Encode the chunk on the worker
       try {
-        const encoded = await workerEncode<D>(worker, chunkData, metaId, codecMeta)
+        const encode = useShared ? workerEncodeShared : workerEncode
+        const encoded = await encode<D>(worker, chunkData, metaId, codecMeta)
 
         // Write to store on main thread
         await arr.store.set(chunkPath as `/${string}`, encoded)

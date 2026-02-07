@@ -115,12 +115,15 @@ function readConfig(): BenchmarkConfig {
   if ($<HTMLInputElement>('op-read').checked) operations.push('read')
   if ($<HTMLInputElement>('op-write').checked) operations.push('write')
 
+  const useSharedArrayBuffer = $<HTMLInputElement>('opt-sab').checked
+
   return {
     dataset,
     poolSize,
     iterations,
     warmupRuns,
     operations,
+    useSharedArrayBuffer,
   }
 }
 

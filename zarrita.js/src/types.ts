@@ -146,4 +146,13 @@ export interface SetWorkerOptions {
    * codec-worker bundled with this package.
    */
   workerUrl?: string | URL
+  /**
+   * When true, intermediate chunk buffers for partial updates are allocated
+   * on SharedArrayBuffer, enabling zero-transfer sharing between the main
+   * thread and codec workers during the decode-modify-encode cycle.
+   *
+   * Requires Cross-Origin-Opener-Policy and Cross-Origin-Embedder-Policy
+   * headers to be set. Throws if SharedArrayBuffer is not available.
+   */
+  useSharedArrayBuffer?: boolean
 }

@@ -1,10 +1,8 @@
 # @fideus-labs/worker-pool
 
-A Web Worker pool with bounded concurrency. Provides a
-[ChunkQueue](https://github.com/manzt/zarrita.js)-compatible `add` / `onIdle`
-interface, backed by the scheduling engine from
-[itk-wasm](https://github.com/InsightSoftwareConsortium/ITK-Wasm)'s
-`WebWorkerPool`.
+A Web Worker pool with bounded concurrency, plus a companion
+[@fideus-labs/zarrita.js](#zarritajs-integration) package that accelerates
+zarrita codec operations on Web Workers.
 
 ## Features
 
@@ -65,22 +63,6 @@ const results = await pool.onIdle<number>()
 pool.terminateWorkers()
 ```
 
-### zarrita.js integration
-
-The pool satisfies the `ChunkQueue` interface, so it can be used directly with
-zarrita's `create_queue` option:
-
-```ts
-import { get } from 'zarrita'
-import { WorkerPool } from '@fideus-labs/worker-pool'
-
-const pool = new WorkerPool(4)
-
-const result = await get(arr, null, {
-  create_queue: () => pool,
-})
-```
-
 ### Batch interface (`runTasks`)
 
 Submit an array of tasks at once with optional progress reporting and
@@ -134,13 +116,154 @@ Cancel a pending `runTasks` batch. The promise rejects with
 Terminate all idle workers. The pool can still be used after this — new
 workers will be created as needed.
 
+---
+
+## zarrita.js Integration
+
+The `@fideus-labs/zarrita.js` package provides `getWorker` and `setWorker` as
+drop-in replacements for zarrita's `get` and `set`, offloading codec
+encode/decode to Web Workers via the worker pool.
+
+### Installation
+
+```sh
+pnpm add @fideus-labs/zarrita.js @fideus-labs/worker-pool zarrita
+```
+
+### Basic usage
+
+```ts
+import { WorkerPool } from '@fideus-labs/worker-pool'
+import { getWorker, setWorker } from '@fideus-labs/zarrita.js'
+import * as zarr from 'zarrita'
+
+const pool = new WorkerPool(4)
+
+// Open an array
+const store = new zarr.FetchStore('https://example.com/data.zarr')
+const arr = await zarr.open(store, { kind: 'array' })
+
+// Read with codec decode offloaded to workers
+const chunk = await getWorker(arr, null, { pool })
+
+// Write with codec encode offloaded to workers
+await setWorker(arr, null, chunk, { pool })
+
+pool.terminateWorkers()
+```
+
+### SharedArrayBuffer support
+
+Both `getWorker` and `setWorker` support a `useSharedArrayBuffer` option for
+additional performance:
+
+```ts
+// Read — output allocated on SharedArrayBuffer, workers decode directly
+// into shared memory (eliminates one transfer + one copy per chunk)
+const chunk = await getWorker(arr, null, {
+  pool,
+  useSharedArrayBuffer: true,
+})
+
+// chunk.data.buffer instanceof SharedArrayBuffer === true
+// The chunk can be shared with other workers without copying.
+
+// Write — intermediate buffers use SharedArrayBuffer for zero-transfer
+// sharing between main thread and codec workers
+await setWorker(arr, null, chunk, {
+  pool,
+  useSharedArrayBuffer: true,
+})
+```
+
+**`getWorker` with SAB:**
+- Output TypedArray is backed by `SharedArrayBuffer`
+- Codec workers decode chunks AND write directly into the shared output
+  buffer via the `decode_into` message protocol
+- Eliminates 1 ArrayBuffer transfer (worker to main) and 1 main-thread
+  `set_from_chunk` copy per chunk
+- Fill-value chunks are still handled on the main thread
+
+**`setWorker` with SAB:**
+- Intermediate chunk buffers for partial updates use `SharedArrayBuffer`
+- Reduces ArrayBuffer transfers between main thread and codec workers
+  during the decode-modify-encode cycle
+
+### COOP/COEP headers
+
+`SharedArrayBuffer` requires the page to be served with these HTTP headers:
+
+```
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
+```
+
+If these headers are missing, `useSharedArrayBuffer: true` will throw with a
+descriptive error message.
+
+**Vite example:**
+
+```ts
+// vite.config.ts
+export default defineConfig({
+  server: {
+    headers: {
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'require-corp',
+    },
+  },
+})
+```
+
+### `getWorker` options
+
+| Option | Type | Description |
+|---|---|---|
+| `pool` | `WorkerPool` | **Required.** The worker pool to use. |
+| `workerUrl` | `string \| URL` | URL of the codec worker script. Uses built-in default if omitted. |
+| `opts` | `StoreOpts` | Pass-through options for the store's `get` method (e.g., `RequestInit`). |
+| `useSharedArrayBuffer` | `boolean` | Allocate output on SharedArrayBuffer with decode-into-shared optimization. |
+
+### `setWorker` options
+
+| Option | Type | Description |
+|---|---|---|
+| `pool` | `WorkerPool` | **Required.** The worker pool to use. |
+| `workerUrl` | `string \| URL` | URL of the codec worker script. Uses built-in default if omitted. |
+| `useSharedArrayBuffer` | `boolean` | Use SharedArrayBuffer for intermediate chunk buffers during partial updates. |
+
+### Worker message protocol
+
+The codec worker handles four message types:
+
+| Request | Response | Description |
+|---|---|---|
+| `init` | `init_ok` | Register codec metadata (sent once per worker per unique array config) |
+| `decode` | `decoded` | Decode raw bytes, transfer decoded ArrayBuffer back |
+| `decode_into` | `decode_into_ok` | Decode raw bytes and write directly into SharedArrayBuffer output |
+| `encode` | `encoded` | Encode chunk data, transfer encoded bytes back |
+
+## Benchmark
+
+The repository includes a benchmark app that compares vanilla zarrita `get`/`set`
+with `getWorker`/`setWorker` (with and without SharedArrayBuffer):
+
+```sh
+pnpm bench
+# Opens at http://localhost:5174
+```
+
+The benchmark supports both synthetic in-memory arrays and remote OME-Zarr
+datasets from AWS S3.
+
 ## Development
 
 ```sh
 pnpm install
-pnpm build          # compile TypeScript
-pnpm test           # run Playwright browser tests
-pnpm test:ui        # interactive Playwright UI
+pnpm dev           # Start test app dev server (port 5173)
+pnpm bench         # Start benchmark app (port 5174)
+pnpm test          # Run Playwright browser tests
+pnpm test:ui       # Interactive Playwright UI
 ```
 
 ## License

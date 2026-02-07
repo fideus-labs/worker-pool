@@ -16,7 +16,6 @@ import {
 import type {
   BenchmarkResult,
   BenchmarkProgress,
-  BenchmarkOperation,
   OperationResult,
   TimingStats,
 } from './types.js'
@@ -68,7 +67,7 @@ export function updateProgress(p: BenchmarkProgress): void {
 
   const phaseLabel = p.phase === 'warmup' ? 'Warmup' : 'Benchmark'
   const opLabel = p.operation === 'read' ? 'Read' : 'Write'
-  const variantLabel = p.variant === 'vanilla' ? 'Vanilla' : 'Worker'
+  const variantLabel = p.variant === 'vanilla' ? 'Vanilla' : p.variant === 'worker-sab' ? 'Worker+SAB' : 'Worker'
   label.textContent =
     `${phaseLabel} | ${opLabel} (${variantLabel}) | ` +
     `${p.iteration}/${p.totalIterations} | ${(p.progress * 100).toFixed(0)}%`
@@ -109,6 +108,28 @@ function renderSummaryTable(result: BenchmarkResult): void {
   const tbody = $<HTMLTableSectionElement>('results-body')
   tbody.innerHTML = ''
 
+  const hasSab = result.results.some((r) => r.variant === 'worker-sab')
+
+  // Update table header based on whether SAB column is needed
+  const thead = $('results-head')
+  if (hasSab) {
+    thead.innerHTML = `<tr>
+      <th>Operation</th>
+      <th>Vanilla (ms)</th>
+      <th>Worker (ms)</th>
+      <th>Worker+SAB (ms)</th>
+      <th>Speedup (W)</th>
+      <th>Speedup (SAB)</th>
+    </tr>`
+  } else {
+    thead.innerHTML = `<tr>
+      <th>Operation</th>
+      <th>Vanilla (ms)</th>
+      <th>Worker (ms)</th>
+      <th>Speedup</th>
+    </tr>`
+  }
+
   // Group results by operation
   const ops = new Set(result.results.map((r) => r.operation))
 
@@ -119,28 +140,47 @@ function renderSummaryTable(result: BenchmarkResult): void {
     const worker = result.results.find(
       (r) => r.operation === op && r.variant === 'worker',
     )
+    const sab = result.results.find(
+      (r) => r.operation === op && r.variant === 'worker-sab',
+    )
 
     if (!vanilla || !worker) continue
 
     const speedup = vanilla.stats.median / worker.stats.median
-    const speedupClass =
-      speedup > 1.1
-        ? 'speedup-positive'
-        : speedup < 0.9
-          ? 'speedup-negative'
-          : 'speedup-neutral'
+    const speedupClass = fmtSpeedupClass(speedup)
 
     const row = document.createElement('tr')
-    row.innerHTML = `
-      <td>${op === 'read' ? 'Read (get)' : 'Write (set)'}</td>
-      <td>${fmtMs(vanilla.stats.median)} <span style="color:var(--text-dim)">&plusmn;${fmtMs(vanilla.stats.stddev)}</span></td>
-      <td>${fmtMs(worker.stats.median)} <span style="color:var(--text-dim)">&plusmn;${fmtMs(worker.stats.stddev)}</span></td>
-      <td><span class="${speedupClass}">${speedup.toFixed(2)}x</span></td>
-    `
+    if (hasSab && sab) {
+      const sabSpeedup = vanilla.stats.median / sab.stats.median
+      const sabClass = fmtSpeedupClass(sabSpeedup)
+      row.innerHTML = `
+        <td>${op === 'read' ? 'Read (get)' : 'Write (set)'}</td>
+        <td>${fmtMs(vanilla.stats.median)} <span style="color:var(--text-dim)">&plusmn;${fmtMs(vanilla.stats.stddev)}</span></td>
+        <td>${fmtMs(worker.stats.median)} <span style="color:var(--text-dim)">&plusmn;${fmtMs(worker.stats.stddev)}</span></td>
+        <td>${fmtMs(sab.stats.median)} <span style="color:var(--text-dim)">&plusmn;${fmtMs(sab.stats.stddev)}</span></td>
+        <td><span class="${speedupClass}">${speedup.toFixed(2)}x</span></td>
+        <td><span class="${sabClass}">${sabSpeedup.toFixed(2)}x</span></td>
+      `
+    } else {
+      row.innerHTML = `
+        <td>${op === 'read' ? 'Read (get)' : 'Write (set)'}</td>
+        <td>${fmtMs(vanilla.stats.median)} <span style="color:var(--text-dim)">&plusmn;${fmtMs(vanilla.stats.stddev)}</span></td>
+        <td>${fmtMs(worker.stats.median)} <span style="color:var(--text-dim)">&plusmn;${fmtMs(worker.stats.stddev)}</span></td>
+        <td><span class="${speedupClass}">${speedup.toFixed(2)}x</span></td>
+      `
+    }
     tbody.appendChild(row)
   }
 
   $('table-container').classList.remove('hidden')
+}
+
+function fmtSpeedupClass(speedup: number): string {
+  return speedup > 1.1
+    ? 'speedup-positive'
+    : speedup < 0.9
+      ? 'speedup-negative'
+      : 'speedup-neutral'
 }
 
 function fmtMs(ms: number): string {
@@ -161,6 +201,8 @@ function renderMainChart(result: BenchmarkResult): void {
 
   const canvas = $<HTMLCanvasElement>('benchmark-chart')
 
+  const hasSab = result.results.some((r) => r.variant === 'worker-sab')
+
   // Build labels and data
   const ops = [...new Set(result.results.map((r) => r.operation))]
   const labels = ops.map((op) => (op === 'read' ? 'Read' : 'Write'))
@@ -179,29 +221,45 @@ function renderMainChart(result: BenchmarkResult): void {
     return r?.stats.median ?? 0
   })
 
+  const datasets: ChartConfiguration<'bar'>['data']['datasets'] = [
+    {
+      label: 'Vanilla zarrita',
+      data: vanillaData,
+      backgroundColor: 'rgba(99, 102, 241, 0.7)',
+      borderColor: 'rgba(99, 102, 241, 1)',
+      borderWidth: 1,
+      borderRadius: 4,
+    },
+    {
+      label: 'Worker Pool',
+      data: workerData,
+      backgroundColor: 'rgba(6, 182, 212, 0.7)',
+      borderColor: 'rgba(6, 182, 212, 1)',
+      borderWidth: 1,
+      borderRadius: 4,
+    },
+  ]
+
+  if (hasSab) {
+    const sabData = ops.map((op) => {
+      const r = result.results.find(
+        (r) => r.operation === op && r.variant === 'worker-sab',
+      )
+      return r?.stats.median ?? 0
+    })
+    datasets.push({
+      label: 'Worker + SAB',
+      data: sabData,
+      backgroundColor: 'rgba(168, 85, 247, 0.7)',
+      borderColor: 'rgba(168, 85, 247, 1)',
+      borderWidth: 1,
+      borderRadius: 4,
+    })
+  }
+
   const config: ChartConfiguration<'bar'> = {
     type: 'bar',
-    data: {
-      labels,
-      datasets: [
-        {
-          label: 'Vanilla zarrita',
-          data: vanillaData,
-          backgroundColor: 'rgba(99, 102, 241, 0.7)',
-          borderColor: 'rgba(99, 102, 241, 1)',
-          borderWidth: 1,
-          borderRadius: 4,
-        },
-        {
-          label: 'Worker Pool',
-          data: workerData,
-          backgroundColor: 'rgba(6, 182, 212, 0.7)',
-          borderColor: 'rgba(6, 182, 212, 1)',
-          borderWidth: 1,
-          borderRadius: 4,
-        },
-      ],
-    },
+    data: { labels, datasets },
     options: {
       responsive: true,
       maintainAspectRatio: true,
@@ -250,6 +308,9 @@ function renderDetailCharts(result: BenchmarkResult): void {
     const worker = result.results.find(
       (r) => r.operation === op && r.variant === 'worker',
     )
+    const sab = result.results.find(
+      (r) => r.operation === op && r.variant === 'worker-sab',
+    )
     if (!vanilla || !worker) continue
 
     // Wrapper
@@ -266,7 +327,7 @@ function renderDetailCharts(result: BenchmarkResult): void {
     // Stats grid
     const statsGrid = document.createElement('div')
     statsGrid.className = 'stats-grid'
-    statsGrid.innerHTML = buildStatsGrid(vanilla, worker)
+    statsGrid.innerHTML = buildStatsGrid(vanilla, worker, sab)
     wrapper.appendChild(statsGrid)
 
     container.appendChild(wrapper)
@@ -274,29 +335,39 @@ function renderDetailCharts(result: BenchmarkResult): void {
     // Chart
     const labels = vanilla.stats.raw.map((_, i) => `#${i + 1}`)
 
+    const datasets: ChartConfiguration<'bar'>['data']['datasets'] = [
+      {
+        label: 'Vanilla',
+        data: vanilla.stats.raw,
+        backgroundColor: 'rgba(99, 102, 241, 0.5)',
+        borderColor: 'rgba(99, 102, 241, 1)',
+        borderWidth: 1,
+        borderRadius: 3,
+      },
+      {
+        label: 'Worker',
+        data: worker.stats.raw,
+        backgroundColor: 'rgba(6, 182, 212, 0.5)',
+        borderColor: 'rgba(6, 182, 212, 1)',
+        borderWidth: 1,
+        borderRadius: 3,
+      },
+    ]
+
+    if (sab) {
+      datasets.push({
+        label: 'Worker + SAB',
+        data: sab.stats.raw,
+        backgroundColor: 'rgba(168, 85, 247, 0.5)',
+        borderColor: 'rgba(168, 85, 247, 1)',
+        borderWidth: 1,
+        borderRadius: 3,
+      })
+    }
+
     const chart = new Chart(canvas, {
       type: 'bar',
-      data: {
-        labels,
-        datasets: [
-          {
-            label: 'Vanilla',
-            data: vanilla.stats.raw,
-            backgroundColor: 'rgba(99, 102, 241, 0.5)',
-            borderColor: 'rgba(99, 102, 241, 1)',
-            borderWidth: 1,
-            borderRadius: 3,
-          },
-          {
-            label: 'Worker',
-            data: worker.stats.raw,
-            backgroundColor: 'rgba(6, 182, 212, 0.5)',
-            borderColor: 'rgba(6, 182, 212, 1)',
-            borderWidth: 1,
-            borderRadius: 3,
-          },
-        ],
-      },
+      data: { labels, datasets },
       options: {
         responsive: true,
         maintainAspectRatio: true,
@@ -331,6 +402,7 @@ function renderDetailCharts(result: BenchmarkResult): void {
 function buildStatsGrid(
   vanilla: OperationResult,
   worker: OperationResult,
+  sab?: OperationResult,
 ): string {
   const pairs: [string, (s: TimingStats) => string][] = [
     ['Mean', (s) => fmtMs(s.mean)],
@@ -347,6 +419,7 @@ function buildStatsGrid(
         <div class="stat-label">${label}</div>
         <div class="stat-value" style="color:var(--accent)">${fmt(vanilla.stats)}</div>
         <div class="stat-value" style="color:var(--cyan)">${fmt(worker.stats)}</div>
+        ${sab ? `<div class="stat-value" style="color:var(--purple)">${fmt(sab.stats)}</div>` : ''}
       </div>
     `
   }
