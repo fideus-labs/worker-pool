@@ -26,6 +26,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install
 
+      - name: Build worker-pool
+        run: pnpm --filter @fideus-labs/worker-pool... build
+
       - name: Typecheck
         run: pnpm -r build
 
