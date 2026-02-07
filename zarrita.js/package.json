@@ -20,8 +20,7 @@
     "build": "tsc"
   },
   "dependencies": {
-    "@fideus-labs/worker-pool": "workspace:^",
-    "p-queue": "^8.1.0"
+    "@fideus-labs/worker-pool": "workspace:^"
   },
   "peerDependencies": {
     "zarrita": ">=0.6.0"

@@ -6,11 +6,10 @@
  * data modification and store writes, while workers handle the expensive
  * codec operations.
  *
- * Uses p-queue for concurrency control over chunk operations.
+ * Uses WorkerPool.runTasks() for bounded-concurrency scheduling.
  */
 
-import PQueue from 'p-queue'
-import type { WorkerPool } from '@fideus-labs/worker-pool'
+import type { WorkerPool, WorkerPoolTask } from '@fideus-labs/worker-pool'
 import type {
   Array as ZarrArray,
   Chunk,
@@ -26,57 +25,52 @@ import { BasicIndexer, type IndexerProjection } from './internals/indexer.js'
 import { setter } from './internals/setter.js'
 import { get_ctr, get_strides, create_chunk_key_encoder } from './internals/util.js'
 import type { SetWorkerOptions, CodecChunkMeta } from './types.js'
-import { workerDecode, workerEncode } from './worker-rpc.js'
+import { workerDecode, workerEncode, getMetaId } from './worker-rpc.js'
 
 /**
  * Default URL for the codec worker.
  */
 const DEFAULT_WORKER_URL = new URL('./codec-worker.js', import.meta.url)
 
-/**
- * Acquire a worker from the pool's workerQueue.
- */
-function acquireWorker(
-  pool: WorkerPool,
-  workerUrl: string | URL,
-): Worker {
-  const slot = pool.workerQueue.pop()
-  if (slot != null) return slot
-  return new Worker(workerUrl, { type: 'module' })
+/** Shared TextDecoder instance. */
+const decoder = new TextDecoder()
+
+// ---------------------------------------------------------------------------
+// Unified metadata reader — reads zarr.json once, returns everything needed
+// ---------------------------------------------------------------------------
+
+interface ArrayMetadata {
+  codecMeta: CodecChunkMeta
+  encodeChunkKey: (chunk_coords: number[]) => string
+  fillValue: Scalar<DataType> | null
 }
 
-/**
- * Return a worker to the pool for reuse.
- */
-function releaseWorker(pool: WorkerPool, worker: Worker): void {
-  pool.workerQueue.push(worker)
-}
-
-/**
- * Read the codec metadata from the zarr store.
- */
-async function readCodecMeta<D extends DataType>(
+async function readArrayMetadata<D extends DataType>(
   arr: ZarrArray<D, Mutable>,
-): Promise<CodecChunkMeta> {
+): Promise<ArrayMetadata> {
   const store = arr.store
 
-  // Try v3
+  // Try v3 first: read zarr.json
   const v3Path = (arr.path === '/' ? '/zarr.json' : `${arr.path}/zarr.json`) as `/${string}`
   const v3Bytes = await store.get(v3Path)
   if (v3Bytes) {
-    const metadata = JSON.parse(new TextDecoder().decode(v3Bytes))
+    const metadata = JSON.parse(decoder.decode(v3Bytes))
     return {
-      data_type: metadata.data_type,
-      chunk_shape: metadata.chunk_grid.configuration.chunk_shape,
-      codecs: metadata.codecs,
+      codecMeta: {
+        data_type: metadata.data_type,
+        chunk_shape: metadata.chunk_grid.configuration.chunk_shape,
+        codecs: metadata.codecs,
+      },
+      encodeChunkKey: create_chunk_key_encoder(metadata.chunk_key_encoding),
+      fillValue: metadata.fill_value ?? null,
     }
   }
 
-  // Try v2
+  // Try v2: read .zarray
   const v2Path = (arr.path === '/' ? '/.zarray' : `${arr.path}/.zarray`) as `/${string}`
   const v2Bytes = await store.get(v2Path)
   if (v2Bytes) {
-    const metadata = JSON.parse(new TextDecoder().decode(v2Bytes))
+    const metadata = JSON.parse(decoder.decode(v2Bytes))
     const codecs: Array<{ name: string; configuration: Record<string, unknown> }> = []
     if (metadata.order === 'F') {
       codecs.push({ name: 'transpose', configuration: { order: 'F' } })
@@ -89,47 +83,34 @@ async function readCodecMeta<D extends DataType>(
       codecs.push({ name: id, configuration })
     }
     return {
-      data_type: arr.dtype,
-      chunk_shape: arr.chunks,
-      codecs: codecs.length > 0 ? codecs : [{ name: 'bytes', configuration: { endian: 'little' } }],
+      codecMeta: {
+        data_type: arr.dtype,
+        chunk_shape: arr.chunks,
+        codecs: codecs.length > 0 ? codecs : [{ name: 'bytes', configuration: { endian: 'little' } }],
+      },
+      encodeChunkKey: create_chunk_key_encoder({
+        name: 'v2',
+        configuration: { separator: metadata.dimension_separator ?? '.' },
+      }),
+      fillValue: metadata.fill_value ?? null,
     }
   }
 
-  // Fallback
+  // Fallback: BytesCodec only, default v3 key encoding
   return {
-    data_type: arr.dtype,
-    chunk_shape: arr.chunks,
-    codecs: [{ name: 'bytes', configuration: { endian: 'little' } }],
+    codecMeta: {
+      data_type: arr.dtype,
+      chunk_shape: arr.chunks,
+      codecs: [{ name: 'bytes', configuration: { endian: 'little' } }],
+    },
+    encodeChunkKey: create_chunk_key_encoder({ name: 'default' }),
+    fillValue: null,
   }
 }
 
-/**
- * Read the chunk key encoding from store metadata.
- */
-async function readChunkKeyEncoding<D extends DataType>(
-  arr: ZarrArray<D, Mutable>,
-): Promise<(chunk_coords: number[]) => string> {
-  const store = arr.store
-
-  const v3Path = (arr.path === '/' ? '/zarr.json' : `${arr.path}/zarr.json`) as `/${string}`
-  const v3Bytes = await store.get(v3Path)
-  if (v3Bytes) {
-    const metadata = JSON.parse(new TextDecoder().decode(v3Bytes))
-    return create_chunk_key_encoder(metadata.chunk_key_encoding)
-  }
-
-  const v2Path = (arr.path === '/' ? '/.zarray' : `${arr.path}/.zarray`) as `/${string}`
-  const v2Bytes = await store.get(v2Path)
-  if (v2Bytes) {
-    const metadata = JSON.parse(new TextDecoder().decode(v2Bytes))
-    return create_chunk_key_encoder({
-      name: 'v2',
-      configuration: { separator: metadata.dimension_separator ?? '.' },
-    })
-  }
-
-  return create_chunk_key_encoder({ name: 'default' })
-}
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 function flip_indexer_projection(
   m: IndexerProjection,
@@ -149,6 +130,10 @@ function is_total_slice(
   })
 }
 
+// ---------------------------------------------------------------------------
+// setWorker
+// ---------------------------------------------------------------------------
+
 /**
  * Write data to a zarrita Array with codec encode/decode offloaded to Web Workers.
  *
@@ -159,7 +144,7 @@ function is_total_slice(
  * @param arr       - The zarrita Array to write to.
  * @param selection - Index selection (null for full array, or per-dimension slices/indices).
  * @param value     - Scalar value or Chunk to write.
- * @param opts      - Options including the WorkerPool and concurrency.
+ * @param opts      - Options including the WorkerPool.
  *
  * @example
  * ```ts
@@ -185,14 +170,14 @@ export async function setWorker<D extends DataType>(
   value: Scalar<D> | Chunk<D>,
   opts: SetWorkerOptions,
 ): Promise<void> {
-  const { pool, concurrency, workerUrl } = opts
+  const { pool, workerUrl } = opts
   const resolvedWorkerUrl = workerUrl ?? DEFAULT_WORKER_URL
 
-  // Read metadata from store
-  const [codecMeta, encodeChunkKey] = await Promise.all([
-    readCodecMeta(arr),
-    readChunkKeyEncoding(arr),
-  ])
+  // Read metadata from store — single read, single parse
+  const { codecMeta, encodeChunkKey, fillValue } = await readArrayMetadata(arr)
+
+  // Get stable metaId for the codec metadata
+  const metaId = getMetaId(codecMeta)
 
   const Ctr = get_ctr(arr.dtype)
 
@@ -203,32 +188,22 @@ export async function setWorker<D extends DataType>(
     chunk_shape: arr.chunks,
   })
 
-  const chunkSize = arr.chunks.reduce((a: number, b: number) => a * b, 1)
+  // Pre-compute chunk invariants (hoisted out of loop)
+  const chunkShape = arr.chunks
+  const chunkStrides = get_strides(chunkShape)
+  const chunkSize = chunkShape.reduce((a: number, b: number) => a * b, 1)
 
-  // Read fill value from metadata
-  let fillValue: Scalar<D> | null = null
-  {
-    const v3Path = (arr.path === '/' ? '/zarr.json' : `${arr.path}/zarr.json`) as `/${string}`
-    const v3Bytes = await arr.store.get(v3Path)
-    if (v3Bytes) {
-      const metadata = JSON.parse(new TextDecoder().decode(v3Bytes))
-      fillValue = metadata.fill_value
-    }
-  }
-
-  // Create p-queue for concurrency control
-  const poolSize = Math.max(pool.workerQueue.length, 1)
-  const queue = new PQueue({ concurrency: concurrency ?? poolSize })
+  // Build tasks — one per chunk
+  const tasks: WorkerPoolTask<void>[] = []
 
   for (const { chunk_coords, mapping } of indexer) {
     const chunkSelection = mapping.map((m) => m.from)
     const flipped = mapping.map(flip_indexer_projection)
+    const chunkKey = encodeChunkKey(chunk_coords)
+    const chunkPath = arr.resolve(chunkKey).path
 
-    void queue.add(async () => {
-      const chunkKey = encodeChunkKey(chunk_coords)
-      const chunkPath = arr.resolve(chunkKey).path
-      const chunkShape = arr.chunks.slice()
-      const chunkStride = get_strides(chunkShape)
+    tasks.push(async (workerSlot: Worker | null) => {
+      const worker = workerSlot ?? new Worker(resolvedWorkerUrl, { type: 'module' })
 
       let chunkData: TypedArray<D>
 
@@ -236,7 +211,7 @@ export async function setWorker<D extends DataType>(
         // Totally replace this chunk — no need to fetch existing data
         chunkData = new Ctr(chunkSize) as TypedArray<D>
         if (typeof value === 'object' && value !== null) {
-          const chunk = setter.prepare(chunkData, chunkShape.slice(), chunkStride.slice()) as Chunk<D>
+          const chunk = setter.prepare(chunkData, chunkShape.slice(), chunkStrides.slice()) as Chunk<D>
           setter.set_from_chunk(
             chunk,
             value as Chunk<D>,
@@ -252,11 +227,9 @@ export async function setWorker<D extends DataType>(
 
         if (rawBytes) {
           // Decode existing chunk on worker
-          const worker = acquireWorker(pool, resolvedWorkerUrl)
           try {
-            const decoded = await workerDecode<D>(worker, rawBytes, codecMeta)
+            const decoded = await workerDecode<D>(worker, rawBytes, metaId, codecMeta)
             chunkData = decoded.data
-            releaseWorker(pool, worker)
           } catch (error) {
             worker.terminate()
             throw error
@@ -270,7 +243,7 @@ export async function setWorker<D extends DataType>(
           }
         }
 
-        const chunk = setter.prepare(chunkData, chunkShape.slice(), chunkStride.slice()) as Chunk<D>
+        const chunk = setter.prepare(chunkData, chunkShape.slice(), chunkStrides.slice()) as Chunk<D>
         if (typeof value === 'object' && value !== null) {
           setter.set_from_chunk(
             chunk,
@@ -282,11 +255,9 @@ export async function setWorker<D extends DataType>(
         }
       }
 
-      // Encode the chunk on a worker
-      const worker = acquireWorker(pool, resolvedWorkerUrl)
+      // Encode the chunk on the worker
       try {
-        const encoded = await workerEncode<D>(worker, chunkData, codecMeta)
-        releaseWorker(pool, worker)
+        const encoded = await workerEncode<D>(worker, chunkData, metaId, codecMeta)
 
         // Write to store on main thread
         await arr.store.set(chunkPath as `/${string}`, encoded)
@@ -294,8 +265,14 @@ export async function setWorker<D extends DataType>(
         worker.terminate()
         throw error
       }
+
+      return { worker, result: undefined as void }
     })
   }
 
-  await queue.onIdle()
+  // Execute all tasks with bounded concurrency via WorkerPool
+  if (tasks.length > 0) {
+    const { promise } = pool.runTasks(tasks)
+    await promise
+  }
 }

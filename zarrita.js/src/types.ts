@@ -26,11 +26,23 @@ export interface CodecChunkMeta {
 // Worker message protocol
 // ---------------------------------------------------------------------------
 
+export interface InitRequest {
+  type: 'init'
+  id: number
+  metaId: number
+  meta: CodecChunkMeta
+}
+
+export interface InitResponse {
+  type: 'init_ok'
+  id: number
+}
+
 export interface DecodeRequest {
   type: 'decode'
   id: number
   bytes: ArrayBuffer
-  meta: CodecChunkMeta
+  metaId: number
 }
 
 export interface DecodeResponse {
@@ -45,7 +57,7 @@ export interface EncodeRequest {
   type: 'encode'
   id: number
   data: ArrayBuffer
-  meta: CodecChunkMeta
+  metaId: number
 }
 
 export interface EncodeResponse {
@@ -54,8 +66,8 @@ export interface EncodeResponse {
   bytes: ArrayBuffer
 }
 
-export type WorkerRequest = DecodeRequest | EncodeRequest
-export type WorkerResponse = DecodeResponse | EncodeResponse
+export type WorkerRequest = InitRequest | DecodeRequest | EncodeRequest
+export type WorkerResponse = InitResponse | DecodeResponse | EncodeResponse
 
 // ---------------------------------------------------------------------------
 // Options for getWorker / setWorker
@@ -64,11 +76,6 @@ export type WorkerResponse = DecodeResponse | EncodeResponse
 export interface GetWorkerOptions<StoreOpts = unknown> {
   /** The WorkerPool to use for codec decode operations. */
   pool: WorkerPool
-  /**
-   * Maximum number of concurrent chunk operations.
-   * Defaults to the pool size (workerQueue initial length).
-   */
-  concurrency?: number
   /** Pass-through options for the store's `get` method (e.g., RequestInit for FetchStore). */
   opts?: StoreOpts
   /**
@@ -81,11 +88,6 @@ export interface GetWorkerOptions<StoreOpts = unknown> {
 export interface SetWorkerOptions {
   /** The WorkerPool to use for codec encode/decode operations. */
   pool: WorkerPool
-  /**
-   * Maximum number of concurrent chunk operations.
-   * Defaults to the pool size (workerQueue initial length).
-   */
-  concurrency?: number
   /**
    * URL of the codec worker script. If not provided, uses the default
    * codec-worker bundled with this package.

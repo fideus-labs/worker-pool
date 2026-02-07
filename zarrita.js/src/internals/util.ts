@@ -59,18 +59,25 @@ export function get_strides(
   order: 'C' | 'F' | number[] = 'C',
 ): number[] {
   const rank = shape.length
-  let permutation: number[]
-  if (typeof order === 'string') {
-    permutation =
-      order === 'C'
-        ? Array.from({ length: rank }, (_, i) => i)
-        : Array.from({ length: rank }, (_, i) => rank - 1 - i)
-  } else {
-    permutation = order
+  const stride = new Array<number>(rank)
+
+  // Fast path for common C-order — no permutation array needed
+  if (order === 'C') {
+    let step = 1
+    for (let i = rank - 1; i >= 0; i--) {
+      stride[i] = step
+      step *= shape[i]
+    }
+    return stride
   }
 
+  // F-order or custom permutation
+  const permutation: number[] =
+    typeof order === 'string'
+      ? Array.from({ length: rank }, (_, i) => rank - 1 - i)
+      : order
+
   let step = 1
-  const stride = new Array<number>(rank)
   for (let i = permutation.length - 1; i >= 0; i--) {
     stride[permutation[i]] = step
     step *= shape[permutation[i]]

@@ -378,10 +378,11 @@ test.describe('@fideus-labs/zarrita.js — getWorker / setWorker', () => {
   // Concurrency control
   // -------------------------------------------------------------------------
 
-  test('respects concurrency option', async ({ page }) => {
+  test('pool size controls concurrency', async ({ page }) => {
     const result = await page.evaluate(async () => {
       const { zarr, getWorker, setWorker, WorkerPool } = window
-      const pool = new WorkerPool(4)
+      // Pool size IS the concurrency (no separate concurrency option)
+      const pool = new WorkerPool(2)
 
       const store = zarr.root()
       // 16 chunks to process
@@ -395,8 +396,8 @@ test.describe('@fideus-labs/zarrita.js — getWorker / setWorker', () => {
       for (let i = 0; i < 16; i++) data[i] = i * 10
       await zarr.set(arr, null, { data, shape: [16], stride: [1] })
 
-      // Read with concurrency limited to 2
-      const chunk = await getWorker(arr, null, { pool, concurrency: 2 })
+      // Read — pool size (2) controls concurrency
+      const chunk = await getWorker(arr, null, { pool })
       pool.terminateWorkers()
 
       return Array.from(chunk.data as Int32Array)

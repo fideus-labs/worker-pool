@@ -186,7 +186,7 @@ export async function runBenchmark(
       // Warmup
       for (let i = 0; i < config.warmupRuns; i++) {
         checkAbort()
-        await getWorker(readArr, null, { pool, concurrency: config.concurrency, workerUrl })
+        await getWorker(readArr, null, { pool, workerUrl })
         report('warmup', 'read', 'worker', i + 1, config.warmupRuns)
       }
 
@@ -194,7 +194,7 @@ export async function runBenchmark(
       for (let i = 0; i < config.iterations; i++) {
         checkAbort()
         const ms = await timeAsync(() =>
-          getWorker(readArr, null, { pool, concurrency: config.concurrency, workerUrl }).then(() => {}),
+          getWorker(readArr, null, { pool, workerUrl }).then(() => {}),
         )
         workerTimes.push(ms)
         report('benchmark', 'read', 'worker', i + 1, config.iterations)
@@ -254,7 +254,7 @@ export async function runBenchmark(
           data: writeRefData,
           shape: shape.slice(),
           stride: writeStrides.slice(),
-        } as Chunk<DataType>, { pool, concurrency: config.concurrency, workerUrl })
+        } as Chunk<DataType>, { pool, workerUrl })
         report('warmup', 'write', 'worker', i + 1, config.warmupRuns)
       }
 
@@ -266,7 +266,7 @@ export async function runBenchmark(
             data: writeRefData!,
             shape: shape.slice(),
             stride: writeStrides!.slice(),
-          } as Chunk<DataType>, { pool, concurrency: config.concurrency, workerUrl }),
+          } as Chunk<DataType>, { pool, workerUrl }),
         )
         workerTimes.push(ms)
         report('benchmark', 'write', 'worker', i + 1, config.iterations)
