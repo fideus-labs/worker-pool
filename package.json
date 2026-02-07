@@ -1,0 +1,48 @@
+{
+  "name": "@fideus-labs/worker-pool",
+  "version": "0.1.0",
+  "description": "A web worker pool with a ChunkQueue-compatible interface, ported from itk-wasm's WebWorkerPool.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "LICENSE.txt"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "vite test/app",
+    "test": "playwright test",
+    "test:ui": "playwright test --ui"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fideus-labs/worker-pool.git"
+  },
+  "keywords": [
+    "web-worker",
+    "worker-pool",
+    "concurrency",
+    "chunk-queue",
+    "zarrita",
+    "itk-wasm"
+  ],
+  "author": "Fideus Labs LLC <info@fideus.io>",
+  "license": "MIT",
+  "sideEffects": false,
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.52.0",
+    "typescript": "^5.8.2",
+    "vite": "^6.3.5"
+  }
+}
