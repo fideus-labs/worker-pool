@@ -108,7 +108,6 @@ function readConfig(): BenchmarkConfig {
   }
 
   const poolSize = parseInt($<HTMLInputElement>('pool-size').value, 10)
-  const concurrency = parseInt($<HTMLInputElement>('concurrency').value, 10)
   const iterations = parseInt($<HTMLInputElement>('iterations').value, 10)
   const warmupRuns = parseInt($<HTMLInputElement>('warmup').value, 10)
 
@@ -119,7 +118,6 @@ function readConfig(): BenchmarkConfig {
   return {
     dataset,
     poolSize,
-    concurrency,
     iterations,
     warmupRuns,
     operations,

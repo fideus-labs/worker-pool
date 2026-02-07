@@ -50,7 +50,6 @@ export type BenchmarkOperation = 'read' | 'write'
 export interface BenchmarkConfig {
   dataset: DatasetConfig
   poolSize: number
-  concurrency: number
   iterations: number
   warmupRuns: number
   operations: BenchmarkOperation[]
