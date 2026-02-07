@@ -23,7 +23,7 @@ export default defineConfig({
     alias: {
       // Map workspace package imports to TypeScript source
       '@fideus-labs/worker-pool': resolve(repoRoot, 'src/index.ts'),
-      '@fideus-labs/zarrita.js': resolve(repoRoot, 'zarrita.js/src/index.ts'),
+      '@fideus-labs/fizarrita': resolve(repoRoot, 'fizarrita/src/index.ts'),
       // Allow direct relative imports into repo source via $root
       '$root': repoRoot,
     },

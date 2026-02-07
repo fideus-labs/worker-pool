@@ -131,7 +131,7 @@ async function readArrayMetadata<D extends DataType, Store extends Readable>(
  * @example
  * ```ts
  * import { WorkerPool } from '@fideus-labs/worker-pool'
- * import { getWorker } from '@fideus-labs/zarrita.js'
+ * import { getWorker } from '@fideus-labs/fizarrita'
  * import * as zarr from 'zarrita'
  *
  * const pool = new WorkerPool(4)

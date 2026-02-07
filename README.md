@@ -1,7 +1,7 @@
 # @fideus-labs/worker-pool
 
 A Web Worker pool with bounded concurrency, plus a companion
-[@fideus-labs/zarrita.js](#zarritajs-integration) package that accelerates
+[@fideus-labs/fizarrita](#zarritajs-integration) package that accelerates
 zarrita codec operations on Web Workers.
 
 ## Features
@@ -120,21 +120,21 @@ workers will be created as needed.
 
 ## zarrita.js Integration
 
-The `@fideus-labs/zarrita.js` package provides `getWorker` and `setWorker` as
+The `@fideus-labs/fizarrita` package provides `getWorker` and `setWorker` as
 drop-in replacements for zarrita's `get` and `set`, offloading codec
 encode/decode to Web Workers via the worker pool.
 
 ### Installation
 
 ```sh
-pnpm add @fideus-labs/zarrita.js @fideus-labs/worker-pool zarrita
+pnpm add @fideus-labs/fizarrita @fideus-labs/worker-pool zarrita
 ```
 
 ### Basic usage
 
 ```ts
 import { WorkerPool } from '@fideus-labs/worker-pool'
-import { getWorker, setWorker } from '@fideus-labs/zarrita.js'
+import { getWorker, setWorker } from '@fideus-labs/fizarrita'
 import * as zarr from 'zarrita'
 
 const pool = new WorkerPool(4)

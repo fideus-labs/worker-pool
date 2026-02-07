@@ -1,5 +1,5 @@
 /**
- * @fideus-labs/zarrita.js — Worker-pool-accelerated get/set for zarrita.
+ * @fideus-labs/fizarrita — Worker-pool-accelerated get/set for zarrita.
  *
  * Provides `getWorker` and `setWorker` as drop-in replacements for zarrita's
  * `get` and `set` that offload codec encode/decode to Web Workers via a

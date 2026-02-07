@@ -63,12 +63,12 @@ import type {
 } from './zarrita/index.js'
 
 // ---------------------------------------------------------------------------
-// @fideus-labs/zarrita.js — real zarrita integration
+// @fideus-labs/fizarrita — real zarrita integration
 // ---------------------------------------------------------------------------
 
 import * as zarr from 'zarrita'
-import { getWorker, setWorker } from '../../zarrita.js/src/index.js'
-import type { GetWorkerOptions, SetWorkerOptions } from '../../zarrita.js/src/index.js'
+import { getWorker, setWorker } from '../../fizarrita/src/index.js'
+import type { GetWorkerOptions, SetWorkerOptions } from '../../fizarrita/src/index.js'
 
 // Expose helpers on the window so Playwright tests can call them.
 declare global {

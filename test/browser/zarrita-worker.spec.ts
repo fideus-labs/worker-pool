@@ -1,5 +1,5 @@
 /**
- * Integration tests for @fideus-labs/zarrita.js getWorker/setWorker.
+ * Integration tests for @fideus-labs/fizarrita getWorker/setWorker.
  *
  * These tests exercise the real zarrita library with actual codec pipelines,
  * verifying that getWorker and setWorker produce identical results to
@@ -13,7 +13,7 @@ async function evaluate<T>(page: Page, fn: string): Promise<T> {
   return page.evaluate(fn) as Promise<T>
 }
 
-test.describe('@fideus-labs/zarrita.js — getWorker / setWorker', () => {
+test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
 
   test.beforeEach(async ({ page }) => {
     await page.goto('/')

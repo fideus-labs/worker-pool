@@ -27,7 +27,7 @@ importers:
         specifier: ^0.6.1
         version: 0.6.1
 
-  zarrita.js:
+  fizarrita:
     dependencies:
       '@fideus-labs/worker-pool':
         specifier: workspace:^

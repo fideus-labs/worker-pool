@@ -9,9 +9,9 @@ import * as zarr from 'zarrita'
 import type { DataType, Chunk, Array as ZarrArray, Readable, Mutable } from 'zarrita'
 import { FetchStore } from '@zarrita/storage'
 import { WorkerPool } from '@fideus-labs/worker-pool'
-import { getWorker, setWorker } from '@fideus-labs/zarrita.js'
+import { getWorker, setWorker } from '@fideus-labs/fizarrita'
 import { createSyntheticArray } from './synthetic.js'
-import codecWorkerUrl from '$root/zarrita.js/src/codec-worker.ts?worker&url'
+import codecWorkerUrl from '$root/fizarrita/src/codec-worker.ts?worker&url'
 import type {
   BenchmarkConfig,
   BenchmarkResult,

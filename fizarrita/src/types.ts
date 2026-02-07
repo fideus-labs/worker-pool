@@ -1,5 +1,5 @@
 /**
- * Types for @fideus-labs/zarrita.js
+ * Types for @fideus-labs/fizarrita
  *
  * Includes worker message protocol types, options for getWorker/setWorker,
  * and codec chunk metadata for reconstructing codec pipelines in workers.
