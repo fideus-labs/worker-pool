@@ -1,5 +1,7 @@
 # @fideus-labs/worker-pool
 
+[![CI](https://github.com/fideus-labs/worker-pool/actions/workflows/ci.yml/badge.svg)](https://github.com/fideus-labs/worker-pool/actions/workflows/ci.yml)
+
 A Web Worker pool with bounded concurrency, plus a companion
 [@fideus-labs/fizarrita](#zarritajs-integration) package that accelerates
 zarrita codec operations on Web Workers.
