@@ -62,6 +62,14 @@ import type {
   WorkerPoolQueueOptions,
 } from './zarrita/index.js'
 
+// ---------------------------------------------------------------------------
+// @fideus-labs/zarrita.js — real zarrita integration
+// ---------------------------------------------------------------------------
+
+import * as zarr from 'zarrita'
+import { getWorker, setWorker } from '../../zarrita.js/src/index.js'
+import type { GetWorkerOptions, SetWorkerOptions } from '../../zarrita.js/src/index.js'
+
 // Expose helpers on the window so Playwright tests can call them.
 declare global {
   interface Window {
@@ -69,7 +77,7 @@ declare global {
     createSquareTask: typeof createSquareTask
     createFailingTask: typeof createFailingTask
     testWorkerUrl: string
-    // Zarrita helpers
+    // Zarrita helpers (test port)
     ZarrArray: typeof ZarrArray
     zarrGet: typeof zarrGet
     zarrSet: typeof zarrSet
@@ -79,6 +87,10 @@ declare global {
     createDefaultQueue: typeof createDefaultQueue
     workerPoolGetOptions: typeof workerPoolGetOptions
     workerPoolSetOptions: typeof workerPoolSetOptions
+    // Real zarrita + getWorker/setWorker
+    zarr: typeof zarr
+    getWorker: typeof getWorker
+    setWorker: typeof setWorker
   }
 }
 
@@ -87,7 +99,7 @@ window.createSquareTask = createSquareTask
 window.createFailingTask = createFailingTask
 window.testWorkerUrl = testWorkerUrl
 
-// Zarrita
+// Zarrita (test port)
 window.ZarrArray = ZarrArray
 window.zarrGet = zarrGet
 window.zarrSet = zarrSet
@@ -97,3 +109,8 @@ window.IndexError = IndexError
 window.createDefaultQueue = createDefaultQueue
 window.workerPoolGetOptions = workerPoolGetOptions
 window.workerPoolSetOptions = workerPoolSetOptions
+
+// Real zarrita + worker-accelerated get/set
+window.zarr = zarr
+window.getWorker = getWorker
+window.setWorker = setWorker

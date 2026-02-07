@@ -1,0 +1,3 @@
+packages:
+  - '.'
+  - 'zarrita.js'

@@ -38,11 +38,15 @@
   "license": "MIT",
   "sideEffects": false,
   "pnpm": {
-    "onlyBuiltDependencies": ["esbuild"]
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
   },
   "devDependencies": {
     "@playwright/test": "^1.52.0",
+    "@zarrita/storage": "^0.1.4",
     "typescript": "^5.8.2",
-    "vite": "^6.3.5"
+    "vite": "^6.3.5",
+    "zarrita": "^0.6.1"
   }
 }

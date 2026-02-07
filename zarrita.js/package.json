@@ -1,0 +1,49 @@
+{
+  "name": "@fideus-labs/zarrita.js",
+  "version": "0.1.0",
+  "description": "Worker-pool-accelerated get/set for zarrita.js — offloads codec encode/decode to Web Workers.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc"
+  },
+  "dependencies": {
+    "@fideus-labs/worker-pool": "workspace:^",
+    "p-queue": "^8.1.0"
+  },
+  "peerDependencies": {
+    "zarrita": ">=0.6.0"
+  },
+  "devDependencies": {
+    "@zarrita/storage": "^0.1.4",
+    "typescript": "^5.8.2",
+    "zarrita": "^0.6.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fideus-labs/worker-pool.git",
+    "directory": "zarrita.js"
+  },
+  "keywords": [
+    "zarrita",
+    "zarr",
+    "web-worker",
+    "worker-pool",
+    "codec",
+    "compression"
+  ],
+  "author": "Fideus Labs LLC <info@fideus.io>",
+  "license": "MIT"
+}
