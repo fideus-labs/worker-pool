@@ -7,6 +7,17 @@ const repoRoot = resolve(__dirname, '..')
 
 export default defineConfig({
   root: '.',
+  base: process.env.GITHUB_ACTIONS ? '/worker-pool/' : '/',
+  publicDir: 'public',
+  worker: {
+    format: 'es',
+  },
+  build: {
+    rollupOptions: {
+      // @zarrita/storage's FsStore imports node builtins — not used at runtime
+      external: ['node:buffer', 'node:fs', 'node:path'],
+    },
+  },
   server: {
     port: 5174,
     strictPort: true,

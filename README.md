@@ -245,6 +245,9 @@ The codec worker handles four message types:
 
 ## Benchmark
 
+**[Live Benchmark](https://fideus-labs.github.io/worker-pool/)** — try it in
+your browser.
+
 The repository includes a benchmark app that compares vanilla zarrita `get`/`set`
 with `getWorker`/`setWorker` (with and without SharedArrayBuffer):
 
@@ -254,7 +257,8 @@ pnpm bench
 ```
 
 The benchmark supports both synthetic in-memory arrays and remote OME-Zarr
-datasets from AWS S3.
+datasets from AWS S3. The live version is deployed to GitHub Pages on every
+push to `main`.
 
 ## Development
 
