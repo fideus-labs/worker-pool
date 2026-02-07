@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Worker Pool Benchmark</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <header>
+    <h1>Worker Pool Benchmark</h1>
+    <p class="subtitle">Compare <code>getWorker</code>/<code>setWorker</code> vs vanilla zarrita <code>get</code>/<code>set</code></p>
+  </header>
+
+  <main>
+    <!-- ================================================================= -->
+    <!-- LEFT: Configuration Panel                                         -->
+    <!-- ================================================================= -->
+    <section class="config-panel" id="config-panel">
+      <h2>Configuration</h2>
+
+      <!-- Dataset source -->
+      <fieldset>
+        <legend>Dataset</legend>
+        <div class="radio-group">
+          <label><input type="radio" name="dataset-source" value="synthetic" checked /> Synthetic (in-memory)</label>
+          <label><input type="radio" name="dataset-source" value="remote" /> Remote (OME-Zarr / S3)</label>
+        </div>
+
+        <!-- Synthetic options -->
+        <div id="synthetic-options" class="sub-options">
+          <label>
+            Shape
+            <input type="text" id="syn-shape" value="288,288,288" placeholder="e.g. 288,288,288" />
+          </label>
+          <label>
+            Chunk shape
+            <input type="text" id="syn-chunks" value="96,96,96" placeholder="e.g. 96,96,96" />
+          </label>
+          <label>
+            Data type
+            <select id="syn-dtype">
+              <option value="uint8">uint8</option>
+              <option value="uint16">uint16</option>
+              <option value="int32">int32</option>
+              <option value="float32" selected>float32</option>
+              <option value="float64">float64</option>
+            </select>
+          </label>
+        </div>
+
+        <!-- Remote options -->
+        <div id="remote-options" class="sub-options hidden">
+          <label>
+            Dataset
+            <select id="remote-dataset">
+              <option value="fuel">fuel (64^3, uint8, 2 chunks)</option>
+              <option value="engine">engine (128x256x256, uint8, 16 chunks)</option>
+              <option value="aneurism">aneurism (256^3, uint8, 32 chunks)</option>
+              <option value="bonsai">bonsai (256^3, uint8, 32 chunks)</option>
+              <option value="backpack" selected>backpack (512x512x373, uint16, 96 chunks)</option>
+              <option value="bunny">bunny (512x512x361, uint16, 96 chunks)</option>
+            </select>
+          </label>
+          <div id="remote-info" class="info-box"></div>
+        </div>
+      </fieldset>
+
+      <!-- Pool / concurrency -->
+      <fieldset>
+        <legend>Worker Pool</legend>
+        <label>
+          Pool size
+          <input type="number" id="pool-size" value="4" min="1" max="32" />
+        </label>
+        <label>
+          Concurrency
+          <input type="number" id="concurrency" value="4" min="1" max="64" />
+        </label>
+      </fieldset>
+
+      <!-- Iterations -->
+      <fieldset>
+        <legend>Iterations</legend>
+        <label>
+          Warmup runs
+          <input type="number" id="warmup" value="2" min="0" max="20" />
+        </label>
+        <label>
+          Benchmark iterations
+          <input type="number" id="iterations" value="5" min="1" max="100" />
+        </label>
+      </fieldset>
+
+      <!-- Operations -->
+      <fieldset>
+        <legend>Operations</legend>
+        <div class="checkbox-group">
+          <label><input type="checkbox" id="op-read" checked /> Read (get)</label>
+          <label><input type="checkbox" id="op-write" /> Write (set)</label>
+        </div>
+        <p class="hint">Write benchmarks only available for synthetic datasets.</p>
+      </fieldset>
+
+      <!-- Actions -->
+      <div class="actions">
+        <button id="btn-run" class="btn-primary">Run Benchmark</button>
+        <button id="btn-cancel" class="btn-secondary" disabled>Cancel</button>
+      </div>
+    </section>
+
+    <!-- ================================================================= -->
+    <!-- RIGHT: Results Panel                                              -->
+    <!-- ================================================================= -->
+    <section class="results-panel" id="results-panel">
+      <h2>Results</h2>
+
+      <!-- Progress bar -->
+      <div id="progress-container" class="progress-container hidden">
+        <div class="progress-bar">
+          <div id="progress-fill" class="progress-fill"></div>
+        </div>
+        <p id="progress-label" class="progress-label">Idle</p>
+      </div>
+
+      <!-- Chart -->
+      <div id="chart-container" class="chart-container hidden">
+        <canvas id="benchmark-chart"></canvas>
+      </div>
+
+      <!-- Results table -->
+      <div id="table-container" class="table-container hidden">
+        <table id="results-table">
+          <thead>
+            <tr>
+              <th>Operation</th>
+              <th>Vanilla (ms)</th>
+              <th>Worker (ms)</th>
+              <th>Speedup</th>
+            </tr>
+          </thead>
+          <tbody id="results-body"></tbody>
+        </table>
+      </div>
+
+      <!-- Per-iteration detail -->
+      <div id="detail-container" class="detail-container hidden">
+        <h3>Per-Iteration Timings</h3>
+        <div id="detail-charts"></div>
+      </div>
+
+      <!-- Placeholder when no results -->
+      <div id="no-results" class="no-results">
+        <p>Configure and run a benchmark to see results here.</p>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="./main.ts"></script>
+</body>
+</html>
