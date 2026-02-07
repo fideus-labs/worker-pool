@@ -168,6 +168,10 @@ function init(): void {
   initDatasetToggle()
   initRemoteInfo()
 
+  // Default pool size to the number of logical cores (capped at 128)
+  const poolSizeInput = $<HTMLInputElement>('pool-size')
+  poolSizeInput.value = String(Math.min(navigator?.hardwareConcurrency || 4, 128))
+
   $('btn-run').addEventListener('click', handleRun)
   $('btn-cancel').addEventListener('click', handleCancel)
 }

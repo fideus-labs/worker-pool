@@ -23,12 +23,12 @@
       <fieldset>
         <legend>Dataset</legend>
         <div class="radio-group">
-          <label><input type="radio" name="dataset-source" value="synthetic" checked /> Synthetic (in-memory)</label>
-          <label><input type="radio" name="dataset-source" value="remote" /> Remote (OME-Zarr / S3)</label>
+          <label><input type="radio" name="dataset-source" value="synthetic" /> Synthetic (in-memory)</label>
+          <label><input type="radio" name="dataset-source" value="remote" checked /> Remote (OME-Zarr / S3)</label>
         </div>
 
         <!-- Synthetic options -->
-        <div id="synthetic-options" class="sub-options">
+        <div id="synthetic-options" class="sub-options hidden">
           <label>
             Shape
             <input type="text" id="syn-shape" value="288,288,288" placeholder="e.g. 288,288,288" />
@@ -50,7 +50,7 @@
         </div>
 
         <!-- Remote options -->
-        <div id="remote-options" class="sub-options hidden">
+        <div id="remote-options" class="sub-options">
           <label>
             Dataset
             <select id="remote-dataset">
@@ -71,7 +71,7 @@
         <legend>Worker Pool</legend>
         <label>
           Pool size
-          <input type="number" id="pool-size" value="4" min="1" max="32" />
+          <input type="number" id="pool-size" min="1" max="128" />
         </label>
       </fieldset>
 
@@ -93,7 +93,7 @@
         <legend>Operations</legend>
         <div class="checkbox-group">
           <label><input type="checkbox" id="op-read" checked /> Read (get)</label>
-          <label><input type="checkbox" id="op-write" /> Write (set)</label>
+          <label><input type="checkbox" id="op-write" disabled /> Write (set)</label>
         </div>
         <p class="hint">Write benchmarks only available for synthetic datasets.</p>
       </fieldset>
