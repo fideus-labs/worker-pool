@@ -225,16 +225,16 @@ function renderMainChart(result: BenchmarkResult): void {
     {
       label: 'Vanilla zarrita',
       data: vanillaData,
-      backgroundColor: 'rgba(99, 102, 241, 0.7)',
-      borderColor: 'rgba(99, 102, 241, 1)',
+      backgroundColor: 'rgba(128, 128, 128, 0.7)',
+      borderColor: 'rgba(128, 128, 128, 1)',
       borderWidth: 1,
       borderRadius: 4,
     },
     {
       label: 'Worker Pool',
       data: workerData,
-      backgroundColor: 'rgba(6, 182, 212, 0.7)',
-      borderColor: 'rgba(6, 182, 212, 1)',
+      backgroundColor: 'rgba(53, 98, 160, 0.7)',
+      borderColor: 'rgba(53, 98, 160, 1)',
       borderWidth: 1,
       borderRadius: 4,
     },
@@ -250,8 +250,8 @@ function renderMainChart(result: BenchmarkResult): void {
     datasets.push({
       label: 'Worker + SAB',
       data: sabData,
-      backgroundColor: 'rgba(168, 85, 247, 0.7)',
-      borderColor: 'rgba(168, 85, 247, 1)',
+      backgroundColor: 'rgba(249, 232, 162, 0.7)',
+      borderColor: 'rgba(249, 232, 162, 1)',
       borderWidth: 1,
       borderRadius: 4,
     })
@@ -339,16 +339,16 @@ function renderDetailCharts(result: BenchmarkResult): void {
       {
         label: 'Vanilla',
         data: vanilla.stats.raw,
-        backgroundColor: 'rgba(99, 102, 241, 0.5)',
-        borderColor: 'rgba(99, 102, 241, 1)',
+        backgroundColor: 'rgba(128, 128, 128, 0.5)',
+        borderColor: 'rgba(128, 128, 128, 1)',
         borderWidth: 1,
         borderRadius: 3,
       },
       {
         label: 'Worker',
         data: worker.stats.raw,
-        backgroundColor: 'rgba(6, 182, 212, 0.5)',
-        borderColor: 'rgba(6, 182, 212, 1)',
+        backgroundColor: 'rgba(53, 98, 160, 0.5)',
+        borderColor: 'rgba(53, 98, 160, 1)',
         borderWidth: 1,
         borderRadius: 3,
       },
@@ -358,8 +358,8 @@ function renderDetailCharts(result: BenchmarkResult): void {
       datasets.push({
         label: 'Worker + SAB',
         data: sab.stats.raw,
-        backgroundColor: 'rgba(168, 85, 247, 0.5)',
-        borderColor: 'rgba(168, 85, 247, 1)',
+        backgroundColor: 'rgba(249, 232, 162, 0.5)',
+        borderColor: 'rgba(249, 232, 162, 1)',
         borderWidth: 1,
         borderRadius: 3,
       })
@@ -417,9 +417,9 @@ function buildStatsGrid(
     html += `
       <div class="stat-card">
         <div class="stat-label">${label}</div>
-        <div class="stat-value" style="color:var(--accent)">${fmt(vanilla.stats)}</div>
-        <div class="stat-value" style="color:var(--cyan)">${fmt(worker.stats)}</div>
-        ${sab ? `<div class="stat-value" style="color:var(--purple)">${fmt(sab.stats)}</div>` : ''}
+        <div class="stat-value" style="color:#808080">${fmt(vanilla.stats)}</div>
+        <div class="stat-value" style="color:#3562a0">${fmt(worker.stats)}</div>
+        ${sab ? `<div class="stat-value" style="color:#f9e8a2">${fmt(sab.stats)}</div>` : ''}
       </div>
     `
   }
