@@ -1027,4 +1027,401 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
     expect(result[2].data[2]).toBeCloseTo(3.3, 10)
   })
 
+  // -------------------------------------------------------------------------
+  // SAB decode_into bug: larger 3D arrays where chunks don't evenly divide shape
+  // -------------------------------------------------------------------------
+
+  test('SAB decode_into: 3D array with non-evenly-divisible chunks (OME-Zarr-like)', async ({ page }) => {
+    // This test mirrors real OME-Zarr data: shape [109, 256, 256] with
+    // chunks [28, 64, 128], uint16. Edge chunks in dim 0 have effective
+    // size 25 (109 - 28*3 = 25), not 28.
+    // We use a smaller but proportionally similar geometry to keep the test
+    // fast while still exercising the edge-chunk code path.
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(4)
+
+      // Shape [11, 8, 8] with chunks [3, 4, 4]:
+      // dim 0: 4 chunks — 3 full (3) + 1 edge (2)
+      // dim 1: 2 chunks — both full (4)
+      // dim 2: 2 chunks — both full (4)
+      const shape = [11, 8, 8] as const
+      const chunkShape = [3, 4, 4] as const
+      const totalSize = shape[0] * shape[1] * shape[2] // 704
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [...shape],
+        chunk_shape: [...chunkShape],
+        data_type: 'uint16',
+      })
+
+      // Fill with sequential values
+      const data = new Uint16Array(totalSize)
+      for (let i = 0; i < totalSize; i++) data[i] = i + 1
+      await zarr.set(arr, null, {
+        data,
+        shape: [...shape],
+        stride: [shape[1] * shape[2], shape[2], 1],
+      })
+
+      // Read with SAB
+      const sabResult = await getWorker(arr, null, {
+        pool,
+        useSharedArrayBuffer: true,
+      })
+
+      // Read without SAB (known-good path)
+      const normalResult = await getWorker(arr, null, {
+        pool,
+        useSharedArrayBuffer: false,
+      })
+
+      // Also read with zarr.get for ground truth
+      const builtinResult = await zarr.get(arr, null)
+
+      pool.terminateWorkers()
+
+      const sabData = Array.from(sabResult.data as Uint16Array)
+      const normalData = Array.from(normalResult.data as Uint16Array)
+      const builtinData = Array.from(builtinResult.data as Uint16Array)
+
+      // Find first mismatch
+      let firstMismatchIdx = -1
+      for (let i = 0; i < totalSize; i++) {
+        if (sabData[i] !== normalData[i]) {
+          firstMismatchIdx = i
+          break
+        }
+      }
+
+      return {
+        sabMatchesNormal: sabData.every((v, i) => v === normalData[i]),
+        normalMatchesBuiltin: normalData.every((v, i) => v === builtinData[i]),
+        sabShape: sabResult.shape,
+        normalShape: normalResult.shape,
+        isShared: sabResult.data.buffer instanceof SharedArrayBuffer,
+        totalSize,
+        firstMismatchIdx,
+        // Include some data around mismatch for debugging
+        sabSlice: firstMismatchIdx >= 0
+          ? sabData.slice(Math.max(0, firstMismatchIdx - 2), firstMismatchIdx + 5)
+          : [],
+        normalSlice: firstMismatchIdx >= 0
+          ? normalData.slice(Math.max(0, firstMismatchIdx - 2), firstMismatchIdx + 5)
+          : [],
+      }
+    })
+
+    expect(result.normalMatchesBuiltin).toBe(true)
+    expect(result.isShared).toBe(true)
+    expect(result.sabShape).toEqual([11, 8, 8])
+    expect(result.normalShape).toEqual([11, 8, 8])
+    // The key assertion: SAB path should produce identical results
+    if (!result.sabMatchesNormal) {
+      throw new Error(
+        `SAB decode_into mismatch at index ${result.firstMismatchIdx}. ` +
+        `SAB[...]: [${result.sabSlice}], Normal[...]: [${result.normalSlice}]`
+      )
+    }
+    expect(result.sabMatchesNormal).toBe(true)
+  })
+
+  test('SAB decode_into: 3D uint16 matching real OME-Zarr geometry', async ({ page }) => {
+    // Full-scale test: shape [13, 32, 32] with chunks [4, 8, 16]
+    // dim 0: 4 chunks — 3 full (4) + 1 edge (1)
+    // dim 1: 4 chunks — all full (8)
+    // dim 2: 2 chunks — all full (16)
+    // Total: 32 chunks, including edge chunks
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(4)
+
+      const shape = [13, 32, 32] as const
+      const chunkShape = [4, 8, 16] as const
+      const totalSize = shape[0] * shape[1] * shape[2] // 13312
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [...shape],
+        chunk_shape: [...chunkShape],
+        data_type: 'uint16',
+      })
+
+      // Fill with unique values (i + 1 so no zeros)
+      const data = new Uint16Array(totalSize)
+      for (let i = 0; i < totalSize; i++) data[i] = (i % 65535) + 1
+      await zarr.set(arr, null, {
+        data,
+        shape: [...shape],
+        stride: [shape[1] * shape[2], shape[2], 1],
+      })
+
+      // SAB path
+      const sabResult = await getWorker(arr, null, {
+        pool,
+        useSharedArrayBuffer: true,
+      })
+
+      // Normal path (ground truth)
+      const normalResult = await getWorker(arr, null, {
+        pool,
+        useSharedArrayBuffer: false,
+      })
+
+      pool.terminateWorkers()
+
+      const sabData = Array.from(sabResult.data as Uint16Array)
+      const normalData = Array.from(normalResult.data as Uint16Array)
+
+      let mismatchCount = 0
+      let firstMismatchIdx = -1
+      for (let i = 0; i < totalSize; i++) {
+        if (sabData[i] !== normalData[i]) {
+          mismatchCount++
+          if (firstMismatchIdx === -1) firstMismatchIdx = i
+        }
+      }
+
+      return {
+        match: mismatchCount === 0,
+        mismatchCount,
+        firstMismatchIdx,
+        totalSize,
+        isShared: sabResult.data.buffer instanceof SharedArrayBuffer,
+        sabSlice: firstMismatchIdx >= 0
+          ? sabData.slice(firstMismatchIdx, firstMismatchIdx + 10)
+          : [],
+        normalSlice: firstMismatchIdx >= 0
+          ? normalData.slice(firstMismatchIdx, firstMismatchIdx + 10)
+          : [],
+      }
+    })
+
+    expect(result.isShared).toBe(true)
+    if (!result.match) {
+      throw new Error(
+        `SAB decode_into: ${result.mismatchCount}/${result.totalSize} mismatches. ` +
+        `First at index ${result.firstMismatchIdx}. ` +
+        `SAB: [${result.sabSlice}], Normal: [${result.normalSlice}]`
+      )
+    }
+    expect(result.match).toBe(true)
+  })
+
+  test('SAB decode_into: 2D with non-evenly-divisible chunks', async ({ page }) => {
+    // Simpler 2D case: shape [7, 5] with chunks [3, 2]
+    // dim 0: 3 chunks — 2 full (3) + 1 edge (1)
+    // dim 1: 3 chunks — 2 full (2) + 1 edge (1)
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+
+      const shape = [7, 5] as const
+      const chunkShape = [3, 2] as const
+      const totalSize = shape[0] * shape[1] // 35
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [...shape],
+        chunk_shape: [...chunkShape],
+        data_type: 'int32',
+      })
+
+      const data = new Int32Array(totalSize)
+      for (let i = 0; i < totalSize; i++) data[i] = (i + 1) * 10
+      await zarr.set(arr, null, {
+        data,
+        shape: [...shape],
+        stride: [shape[1], 1],
+      })
+
+      // SAB path
+      const sabResult = await getWorker(arr, null, {
+        pool,
+        useSharedArrayBuffer: true,
+      })
+
+      // Normal path
+      const normalResult = await getWorker(arr, null, {
+        pool,
+        useSharedArrayBuffer: false,
+      })
+
+      pool.terminateWorkers()
+
+      const sabData = Array.from(sabResult.data as Int32Array)
+      const normalData = Array.from(normalResult.data as Int32Array)
+
+      return {
+        sabData,
+        normalData,
+        match: sabData.every((v, i) => v === normalData[i]),
+        isShared: sabResult.data.buffer instanceof SharedArrayBuffer,
+      }
+    })
+
+    expect(result.isShared).toBe(true)
+    expect(result.sabData).toEqual(result.normalData)
+  })
+
+  test('SAB decode_into: large 3D uint16 matching exact OME-Zarr geometry', async ({ page }) => {
+    // Exact geometry from mri_woman.ome.zarr: shape [109, 256, 256] chunks [28, 64, 128]
+    // This is a large test — 109*256*256 = 7143424 elements (14MB of uint16)
+    test.setTimeout(60_000)
+
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(4)
+
+      const shape = [109, 256, 256] as const
+      const chunkShape = [28, 64, 128] as const
+      const totalSize = shape[0] * shape[1] * shape[2]
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [...shape],
+        chunk_shape: [...chunkShape],
+        data_type: 'uint16',
+      })
+
+      // Fill with a pattern that makes corruption obvious
+      // Use row index * 1000 + col index so each element is unique
+      const data = new Uint16Array(totalSize)
+      for (let z = 0; z < shape[0]; z++) {
+        for (let y = 0; y < shape[1]; y++) {
+          for (let x = 0; x < shape[2]; x++) {
+            const idx = z * shape[1] * shape[2] + y * shape[2] + x
+            data[idx] = ((z * 7 + y * 3 + x) % 65535) + 1
+          }
+        }
+      }
+      await zarr.set(arr, null, {
+        data,
+        shape: [...shape],
+        stride: [shape[1] * shape[2], shape[2], 1],
+      })
+
+      // SAB path
+      const sabResult = await getWorker(arr, null, {
+        pool,
+        useSharedArrayBuffer: true,
+      })
+
+      // Normal path (ground truth)
+      const normalResult = await getWorker(arr, null, {
+        pool,
+        useSharedArrayBuffer: false,
+      })
+
+      pool.terminateWorkers()
+
+      const sabData = sabResult.data as Uint16Array
+      const normalData = normalResult.data as Uint16Array
+
+      let mismatchCount = 0
+      let firstMismatchIdx = -1
+      for (let i = 0; i < totalSize; i++) {
+        if (sabData[i] !== normalData[i]) {
+          mismatchCount++
+          if (firstMismatchIdx === -1) firstMismatchIdx = i
+        }
+      }
+
+      return {
+        match: mismatchCount === 0,
+        mismatchCount,
+        firstMismatchIdx,
+        totalSize,
+        isShared: sabResult.data.buffer instanceof SharedArrayBuffer,
+        // Debug info around mismatch
+        sabSlice: firstMismatchIdx >= 0
+          ? Array.from(sabData.slice(firstMismatchIdx, firstMismatchIdx + 8))
+          : [],
+        normalSlice: firstMismatchIdx >= 0
+          ? Array.from(normalData.slice(firstMismatchIdx, firstMismatchIdx + 8))
+          : [],
+        // Convert index to 3D coords for debugging
+        mismatchCoords: firstMismatchIdx >= 0
+          ? {
+              z: Math.floor(firstMismatchIdx / (256 * 256)),
+              y: Math.floor((firstMismatchIdx % (256 * 256)) / 256),
+              x: firstMismatchIdx % 256,
+            }
+          : null,
+      }
+    })
+
+    expect(result.isShared).toBe(true)
+    if (!result.match) {
+      const c = result.mismatchCoords
+      throw new Error(
+        `SAB decode_into: ${result.mismatchCount}/${result.totalSize} mismatches. ` +
+        `First at flat index ${result.firstMismatchIdx} ` +
+        `(z=${c?.z}, y=${c?.y}, x=${c?.x}). ` +
+        `SAB: [${result.sabSlice}], Normal: [${result.normalSlice}]`
+      )
+    }
+    expect(result.match).toBe(true)
+  })
+
+  test('SAB decode_into: slice selection crossing chunk boundaries with edge chunks', async ({ page }) => {
+    // Shape [10, 6] with chunks [3, 4], reading a slice that crosses
+    // chunk boundaries: [1:9, 1:5]
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+
+      const shape = [10, 6] as const
+      const chunkShape = [3, 4] as const
+      const totalSize = shape[0] * shape[1]
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [...shape],
+        chunk_shape: [...chunkShape],
+        data_type: 'float32',
+      })
+
+      const data = new Float32Array(totalSize)
+      for (let i = 0; i < totalSize; i++) data[i] = i + 0.5
+      await zarr.set(arr, null, {
+        data,
+        shape: [...shape],
+        stride: [shape[1], 1],
+      })
+
+      // Read a slice that crosses boundaries: rows 1..8, cols 1..4
+      const sel = [zarr.slice(1, 9), zarr.slice(1, 5)]
+
+      const sabResult = await getWorker(arr, sel, {
+        pool,
+        useSharedArrayBuffer: true,
+      })
+
+      const normalResult = await getWorker(arr, sel, {
+        pool,
+        useSharedArrayBuffer: false,
+      })
+
+      pool.terminateWorkers()
+
+      const sabData = Array.from(sabResult.data as Float32Array)
+      const normalData = Array.from(normalResult.data as Float32Array)
+
+      return {
+        sabData,
+        normalData,
+        match: sabData.every((v, i) => v === normalData[i]),
+        sabShape: sabResult.shape,
+        normalShape: normalResult.shape,
+        isShared: sabResult.data.buffer instanceof SharedArrayBuffer,
+      }
+    })
+
+    expect(result.isShared).toBe(true)
+    expect(result.sabShape).toEqual(result.normalShape)
+    expect(result.sabData).toEqual(result.normalData)
+  })
+
 })
