@@ -170,12 +170,16 @@ async function ensureMeta(
 
 /**
  * Send raw bytes to a codec worker for decoding and return the decoded Chunk.
+ *
+ * @param actualChunkShape - The actual shape of this chunk, accounting for
+ *   edge chunks that may be smaller than chunk_shape from metadata.
  */
 export async function workerDecode<D extends DataType>(
   worker: Worker,
   bytes: Uint8Array,
   metaId: number,
   meta: CodecChunkMeta,
+  actualChunkShape?: number[],
 ): Promise<Chunk<D>> {
   const dispatcher = getDispatcher(worker)
   await ensureMeta(dispatcher, metaId)
@@ -191,7 +195,7 @@ export async function workerDecode<D extends DataType>(
 
   const response = await dispatcher.send(
     id,
-    { type: 'decode', id, bytes: transferBuffer, metaId },
+    { type: 'decode', id, bytes: transferBuffer, metaId, actualChunkShape },
     [transferBuffer],
   ) as { data: ArrayBuffer; shape: number[]; stride: number[] }
 
@@ -313,6 +317,7 @@ export async function workerDecodeInto(
   outputStride: number[],
   projections: Projection[],
   bytesPerElement: number,
+  actualChunkShape?: number[],
 ): Promise<void> {
   const dispatcher = getDispatcher(worker)
   await ensureMeta(dispatcher, metaId)
@@ -341,6 +346,7 @@ export async function workerDecodeInto(
       outputStride,
       projections,
       bytesPerElement,
+      actualChunkShape,
     },
     [transferBuffer],
   )

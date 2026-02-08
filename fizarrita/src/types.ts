@@ -43,6 +43,11 @@ export interface DecodeRequest {
   id: number
   bytes: ArrayBuffer
   metaId: number
+  /**
+   * Actual shape of this chunk, accounting for edge chunks that may be
+   * smaller than chunk_shape. When omitted, chunk_shape from metadata is used.
+   */
+  actualChunkShape?: number[]
 }
 
 export interface DecodeResponse {
@@ -100,6 +105,11 @@ export interface DecodeIntoRequest {
   projections: Projection[]
   /** sizeof one element in bytes (e.g. 4 for int32/float32). */
   bytesPerElement: number
+  /**
+   * Actual shape of this chunk, accounting for edge chunks that may be
+   * smaller than chunk_shape. When omitted, chunk_shape from metadata is used.
+   */
+  actualChunkShape?: number[]
 }
 
 export interface DecodeIntoResponse {

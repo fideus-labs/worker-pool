@@ -200,6 +200,12 @@ export async function getWorker<
     const chunkKey = encodeChunkKey(chunk_coords)
     const chunkPath = arr.resolve(chunkKey).path
 
+    // Compute actual chunk shape for edge chunks: min(chunk_shape[d], array_shape[d] - coord * chunk_shape[d])
+    const actualChunkShape = chunk_coords.map((coord, dim) =>
+      Math.min(chunkShape[dim], arr.shape[dim] - coord * chunkShape[dim]),
+    )
+    const isEdgeChunk = actualChunkShape.some((s, i) => s !== chunkShape[i])
+
     tasks.push(async (workerSlot: Worker | null) => {
       const worker = workerSlot ?? new Worker(resolvedWorkerUrl, { type: 'module' })
 
@@ -208,15 +214,18 @@ export async function getWorker<
 
       if (!rawBytes) {
         // Missing chunk — fill value, no worker needed
-        const chunkData = new Ctr(chunkSize)
+        const fillChunkShape = actualChunkShape
+        const fillChunkStrides = get_strides(fillChunkShape)
+        const fillChunkSize = fillChunkShape.reduce((a: number, b: number) => a * b, 1)
+        const chunkData = new Ctr(fillChunkSize)
         if (fillValue != null) {
           // @ts-expect-error: fill_value type is union
           chunkData.fill(fillValue)
         }
         const chunk: Chunk<D> = {
           data: chunkData as Chunk<D>['data'],
-          shape: chunkShape.slice(),
-          stride: chunkStrides.slice(),
+          shape: fillChunkShape,
+          stride: fillChunkStrides,
         }
         // Copy fill-value chunk into output on main thread
         setter.set_from_chunk(out, chunk, mapping)
@@ -234,6 +243,7 @@ export async function getWorker<
             outStride,
             mapping,
             bytesPerElement,
+            isEdgeChunk ? actualChunkShape : undefined,
           )
         } catch (error) {
           worker.terminate()
@@ -243,7 +253,7 @@ export async function getWorker<
         // Standard path: worker decodes, transfers back, main thread copies
         let chunk: Chunk<D>
         try {
-          chunk = await workerDecode<D>(worker, rawBytes, metaId, codecMeta)
+          chunk = await workerDecode<D>(worker, rawBytes, metaId, codecMeta, isEdgeChunk ? actualChunkShape : undefined)
         } catch (error) {
           worker.terminate()
           throw error

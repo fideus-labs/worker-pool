@@ -1424,4 +1424,279 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
     expect(result.sabData).toEqual(result.normalData)
   })
 
+  // -------------------------------------------------------------------------
+  // Edge chunk tests — non-padded edge chunks (simulating external writers)
+  // -------------------------------------------------------------------------
+  // These tests simulate data written by external tools (e.g., Python zarr)
+  // where edge chunks are stored at their actual smaller size, NOT padded
+  // to the full chunk_shape. This is the spec-compliant behavior for zarr v3.
+  // zarrita's set() always writes full-padded chunks, so these tests manually
+  // write smaller raw chunk data directly to the store.
+
+  test('edge chunks: 1D array with non-padded edge chunk', async ({ page }) => {
+    // shape [7], chunk_shape [3] => chunks: [0..2], [3..5], [6]
+    // The last chunk has only 1 element (not padded to 3).
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [7],
+        chunk_shape: [3],
+        data_type: 'int32',
+      })
+
+      // Write full chunks manually (3 elements each)
+      const chunk0 = new Int32Array([10, 20, 30])
+      const chunk1 = new Int32Array([40, 50, 60])
+      // Edge chunk: only 1 element (NOT padded to 3)
+      const chunk2 = new Int32Array([70])
+
+      const mapStore = arr.store as unknown as {
+        set(k: string, v: Uint8Array): void
+      }
+      mapStore.set('/c/0', new Uint8Array(chunk0.buffer))
+      mapStore.set('/c/1', new Uint8Array(chunk1.buffer))
+      mapStore.set('/c/2', new Uint8Array(chunk2.buffer))
+
+      // Read full array using getWorker (non-SAB path)
+      const chunk = await getWorker(arr, null, { pool })
+      pool.terminateWorkers()
+
+      return {
+        data: Array.from(chunk.data as Int32Array),
+        shape: chunk.shape,
+      }
+    })
+
+    expect(result.shape).toEqual([7])
+    expect(result.data).toEqual([10, 20, 30, 40, 50, 60, 70])
+  })
+
+  test('edge chunks: 3D array mimicking OME-Zarr with non-padded edge chunks', async ({ page }) => {
+    // shape [5, 4, 6], chunk_shape [3, 4, 4]
+    // dim 0: 2 chunks — [0..2] full (3), [3..4] edge (2)
+    // dim 1: 1 chunk — [0..3] full (4)
+    // dim 2: 2 chunks — [0..3] full (4), [4..5] edge (2)
+    //
+    // Chunks:
+    // (0,0,0): shape [3,4,4] = 48 elements — full
+    // (0,0,1): shape [3,4,2] = 24 elements — edge in dim 2
+    // (1,0,0): shape [2,4,4] = 32 elements — edge in dim 0
+    // (1,0,1): shape [2,4,2] = 16 elements — edge in dim 0 AND dim 2
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+
+      const arrayShape = [5, 4, 6]
+      const chunkShape = [3, 4, 4]
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: arrayShape,
+        chunk_shape: chunkShape,
+        data_type: 'float32',
+      })
+
+      // Build expected output: sequential values in C-order
+      const expected = new Float32Array(5 * 4 * 6)
+      for (let i = 0; i < expected.length; i++) expected[i] = i + 1
+
+      // Helper: extract a chunk from the full array at given chunk coords
+      // and write it at its actual (non-padded) size
+      function extractChunk(
+        fullData: Float32Array,
+        fullShape: number[],
+        chunkCoords: number[],
+        chunkShape: number[],
+      ): Float32Array {
+        const actualShape = chunkCoords.map((c, d) =>
+          Math.min(chunkShape[d], fullShape[d] - c * chunkShape[d]),
+        )
+        const size = actualShape.reduce((a, b) => a * b, 1)
+        const result = new Float32Array(size)
+        let idx = 0
+        for (let z = 0; z < actualShape[0]; z++) {
+          for (let y = 0; y < actualShape[1]; y++) {
+            for (let x = 0; x < actualShape[2]; x++) {
+              const gz = chunkCoords[0] * chunkShape[0] + z
+              const gy = chunkCoords[1] * chunkShape[1] + y
+              const gx = chunkCoords[2] * chunkShape[2] + x
+              result[idx++] = fullData[gz * fullShape[1] * fullShape[2] + gy * fullShape[2] + gx]
+            }
+          }
+        }
+        return result
+      }
+
+      const mapStore = arr.store as unknown as { set(k: string, v: Uint8Array): void }
+
+      // Write each chunk at its actual (non-padded) size
+      const nChunks = chunkShape.map((cs, d) => Math.ceil(arrayShape[d] / cs))
+      for (let cz = 0; cz < nChunks[0]; cz++) {
+        for (let cy = 0; cy < nChunks[1]; cy++) {
+          for (let cx = 0; cx < nChunks[2]; cx++) {
+            const data = extractChunk(expected, arrayShape, [cz, cy, cx], chunkShape)
+            const key = `/c/${cz}/${cy}/${cx}`
+            mapStore.set(key, new Uint8Array(data.buffer))
+          }
+        }
+      }
+
+      // Read using getWorker
+      const chunk = await getWorker(arr, null, { pool })
+
+      // Also read using SAB path
+      const sabChunk = await getWorker(arr, null, { pool, useSharedArrayBuffer: true })
+
+      pool.terminateWorkers()
+
+      const workerData = Array.from(chunk.data as Float32Array)
+      const sabData = Array.from(sabChunk.data as Float32Array)
+      const expectedArr = Array.from(expected)
+
+      return {
+        workerData,
+        sabData,
+        expected: expectedArr,
+        workerShape: chunk.shape,
+        sabShape: sabChunk.shape,
+        workerMatch: workerData.every((v, i) => v === expectedArr[i]),
+        sabMatch: sabData.every((v, i) => v === expectedArr[i]),
+        sabIsShared: sabChunk.data.buffer instanceof SharedArrayBuffer,
+      }
+    })
+
+    expect(result.workerShape).toEqual([5, 4, 6])
+    expect(result.sabShape).toEqual([5, 4, 6])
+    expect(result.sabIsShared).toBe(true)
+    expect(result.workerMatch).toBe(true)
+    expect(result.sabMatch).toBe(true)
+    expect(result.workerData).toEqual(result.expected)
+    expect(result.sabData).toEqual(result.expected)
+  })
+
+  test('edge chunks: beechnut-like geometry with non-padded edge chunks', async ({ page }) => {
+    // Mimics beechnut level 2: shape [386, 256, 256] chunks [96, 96, 96]
+    // but smaller: shape [10, 7, 7] chunks [4, 4, 4]
+    // dim 0: 3 chunks — [0..3], [4..7], [8..9] edge (2)
+    // dim 1: 2 chunks — [0..3], [4..6] edge (3)
+    // dim 2: 2 chunks — [0..3], [4..6] edge (3)
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(4)
+
+      const arrayShape = [10, 7, 7]
+      const chunkShape = [4, 4, 4]
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: arrayShape,
+        chunk_shape: chunkShape,
+        data_type: 'uint16',
+      })
+
+      // Build expected output
+      const totalSize = arrayShape[0] * arrayShape[1] * arrayShape[2]
+      const expected = new Uint16Array(totalSize)
+      for (let i = 0; i < totalSize; i++) expected[i] = (i % 65535) + 1
+
+      // Helper: extract chunk data at actual (non-padded) size
+      function extractChunk(
+        fullData: Uint16Array,
+        fullShape: number[],
+        chunkCoords: number[],
+        chunkShape: number[],
+      ): Uint16Array {
+        const actualShape = chunkCoords.map((c, d) =>
+          Math.min(chunkShape[d], fullShape[d] - c * chunkShape[d]),
+        )
+        const size = actualShape.reduce((a, b) => a * b, 1)
+        const result = new Uint16Array(size)
+        let idx = 0
+        for (let z = 0; z < actualShape[0]; z++) {
+          for (let y = 0; y < actualShape[1]; y++) {
+            for (let x = 0; x < actualShape[2]; x++) {
+              const gz = chunkCoords[0] * chunkShape[0] + z
+              const gy = chunkCoords[1] * chunkShape[1] + y
+              const gx = chunkCoords[2] * chunkShape[2] + x
+              result[idx++] = fullData[gz * fullShape[1] * fullShape[2] + gy * fullShape[2] + gx]
+            }
+          }
+        }
+        return result
+      }
+
+      const mapStore = arr.store as unknown as { set(k: string, v: Uint8Array): void }
+
+      const nChunks = chunkShape.map((cs, d) => Math.ceil(arrayShape[d] / cs))
+      for (let cz = 0; cz < nChunks[0]; cz++) {
+        for (let cy = 0; cy < nChunks[1]; cy++) {
+          for (let cx = 0; cx < nChunks[2]; cx++) {
+            const data = extractChunk(expected, arrayShape, [cz, cy, cx], chunkShape)
+            const key = `/c/${cz}/${cy}/${cx}`
+            mapStore.set(key, new Uint8Array(data.buffer.slice(0)))
+          }
+        }
+      }
+
+      // Read using getWorker (non-SAB)
+      const chunk = await getWorker(arr, null, { pool })
+
+      // Read using getWorker (SAB)
+      const sabChunk = await getWorker(arr, null, { pool, useSharedArrayBuffer: true })
+
+      pool.terminateWorkers()
+
+      const workerData = Array.from(chunk.data as Uint16Array)
+      const sabData = Array.from(sabChunk.data as Uint16Array)
+      const expectedArr = Array.from(expected)
+
+      // Find first mismatch for debug
+      let workerMismatchIdx = -1
+      let sabMismatchIdx = -1
+      for (let i = 0; i < totalSize; i++) {
+        if (workerData[i] !== expectedArr[i] && workerMismatchIdx === -1) workerMismatchIdx = i
+        if (sabData[i] !== expectedArr[i] && sabMismatchIdx === -1) sabMismatchIdx = i
+      }
+
+      return {
+        workerMatch: workerData.every((v, i) => v === expectedArr[i]),
+        sabMatch: sabData.every((v, i) => v === expectedArr[i]),
+        workerMismatchIdx,
+        sabMismatchIdx,
+        totalSize,
+        workerShape: chunk.shape,
+        sabShape: sabChunk.shape,
+        sabIsShared: sabChunk.data.buffer instanceof SharedArrayBuffer,
+        // Debug slices around first mismatch
+        workerSlice: workerMismatchIdx >= 0
+          ? workerData.slice(workerMismatchIdx, workerMismatchIdx + 8)
+          : [],
+        expectedSlice: workerMismatchIdx >= 0
+          ? expectedArr.slice(workerMismatchIdx, workerMismatchIdx + 8)
+          : [],
+      }
+    })
+
+    expect(result.workerShape).toEqual([10, 7, 7])
+    expect(result.sabShape).toEqual([10, 7, 7])
+    expect(result.sabIsShared).toBe(true)
+
+    if (!result.workerMatch) {
+      throw new Error(
+        `Non-SAB edge chunk mismatch at index ${result.workerMismatchIdx}/${result.totalSize}. ` +
+        `Got: [${result.workerSlice}], Expected: [${result.expectedSlice}]`
+      )
+    }
+    if (!result.sabMatch) {
+      throw new Error(
+        `SAB edge chunk mismatch at index ${result.sabMismatchIdx}/${result.totalSize}.`
+      )
+    }
+    expect(result.workerMatch).toBe(true)
+    expect(result.sabMatch).toBe(true)
+  })
+
 })

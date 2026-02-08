@@ -29,6 +29,39 @@ import type { CodecChunkMeta, Projection } from './types.js'
 const ctx = self as unknown as DedicatedWorkerGlobalScope
 
 // ---------------------------------------------------------------------------
+// Edge chunk shape correction
+// ---------------------------------------------------------------------------
+
+/**
+ * Fix a decoded chunk's shape and stride when the actual data size differs
+ * from the metadata chunk_shape. This happens with edge chunks — zarr v3
+ * stores edge chunks at their actual smaller size, but our codec pipeline
+ * always reports shape = chunk_shape from metadata.
+ *
+ * If actualChunkShape is provided, use it directly. Otherwise, infer from
+ * the decoded data size vs the metadata chunk_shape.
+ */
+function fixEdgeChunkShapeStride<D extends DataType>(
+  chunk: Chunk<D>,
+  actualChunkShape?: number[],
+): Chunk<D> {
+  if (actualChunkShape) {
+    // Caller told us the actual shape — use it directly
+    const expectedElements = actualChunkShape.reduce((a, b) => a * b, 1)
+    const actualElements = (chunk.data as unknown as ArrayLike<unknown>).length
+    if (actualElements === expectedElements) {
+      return {
+        data: chunk.data,
+        shape: actualChunkShape,
+        stride: get_strides(actualChunkShape, 'C'),
+      }
+    }
+  }
+  // No correction needed or no actualChunkShape provided
+  return chunk
+}
+
+// ---------------------------------------------------------------------------
 // Codec pipeline cache — keyed by metaId (integer lookup, no JSON.stringify)
 // ---------------------------------------------------------------------------
 
@@ -74,8 +107,8 @@ function getOrCreatePipelineLegacy(meta: CodecChunkMeta) {
 
 type WorkerMessage =
   | { type: 'init'; id: number; metaId: number; meta: CodecChunkMeta }
-  | { type: 'decode'; id: number; bytes: ArrayBuffer; metaId?: number; meta?: CodecChunkMeta }
-  | { type: 'decode_into'; id: number; bytes: ArrayBuffer; metaId: number; output: SharedArrayBuffer; outputByteLength: number; outputStride: number[]; projections: Projection[]; bytesPerElement: number }
+  | { type: 'decode'; id: number; bytes: ArrayBuffer; metaId?: number; meta?: CodecChunkMeta; actualChunkShape?: number[] }
+  | { type: 'decode_into'; id: number; bytes: ArrayBuffer; metaId: number; output: SharedArrayBuffer; outputByteLength: number; outputStride: number[]; projections: Projection[]; bytesPerElement: number; actualChunkShape?: number[] }
   | { type: 'encode'; id: number; data: ArrayBuffer; metaId?: number; meta?: CodecChunkMeta }
 
 ctx.addEventListener('message', async (event: MessageEvent<WorkerMessage>) => {
@@ -102,7 +135,10 @@ ctx.addEventListener('message', async (event: MessageEvent<WorkerMessage>) => {
         : getOrCreatePipelineLegacy(msg.meta!)
 
       const bytes = new Uint8Array(msg.bytes)
-      const chunk = await pipeline.decode(bytes) as Chunk<DataType>
+      let chunk = await pipeline.decode(bytes) as Chunk<DataType>
+
+      // Fix shape/stride for edge chunks (smaller than metadata chunk_shape)
+      chunk = fixEdgeChunkShapeStride(chunk, msg.actualChunkShape)
 
       // Extract the underlying ArrayBuffer from the decoded TypedArray
       const dataView = chunk.data as unknown as {
@@ -136,7 +172,10 @@ ctx.addEventListener('message', async (event: MessageEvent<WorkerMessage>) => {
       // Decode and write directly into SharedArrayBuffer — no transfer back
       const pipeline = getPipeline(msg.metaId)
       const bytes = new Uint8Array(msg.bytes)
-      const chunk = await pipeline.decode(bytes) as Chunk<DataType>
+      let chunk = await pipeline.decode(bytes) as Chunk<DataType>
+
+      // Fix shape/stride for edge chunks (smaller than metadata chunk_shape)
+      chunk = fixEdgeChunkShapeStride(chunk, msg.actualChunkShape)
 
       // Create a Uint8Array view over the shared output buffer
       const destView = new Uint8Array(msg.output, 0, msg.outputByteLength)
