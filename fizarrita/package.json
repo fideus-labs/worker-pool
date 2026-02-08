@@ -1,6 +1,6 @@
 {
   "name": "@fideus-labs/fizarrita",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Worker-pool-accelerated get/set for zarrita.js — offloads codec encode/decode to Web Workers.",
   "type": "module",
   "main": "./dist/index.js",
