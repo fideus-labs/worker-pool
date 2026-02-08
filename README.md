@@ -19,7 +19,7 @@ zarrita codec operations on Web Workers.
 ## Installation
 
 ```sh
-pnpm add @fideus-labs/worker-pool
+npm add @fideus-labs/worker-pool
 ```
 
 ## Usage
