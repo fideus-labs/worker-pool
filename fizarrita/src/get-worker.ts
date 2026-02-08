@@ -19,6 +19,7 @@ import type {
   Slice,
 } from 'zarrita'
 import { BasicIndexer } from './internals/indexer.js'
+import { create_codec_pipeline } from './internals/codec-pipeline.js'
 import { setter } from './internals/setter.js'
 import {
   get_ctr,
@@ -113,6 +114,372 @@ async function readArrayMetadata<D extends DataType, Store extends Readable>(
 }
 
 // ---------------------------------------------------------------------------
+// Chunk shape probing — detect and correct wrong metadata chunk_shape
+// ---------------------------------------------------------------------------
+
+/**
+ * Read the decompressed (frame content) size from a zstd-compressed buffer's
+ * frame header, without decompressing. Returns null if not zstd or if the
+ * frame content size is not present.
+ *
+ * Zstd frame format:
+ *   [4 bytes magic 0xFD2FB528] [1 byte FHD] [0-1 byte window] [0-4 dict] [0-8 FCS]
+ */
+export function readZstdFrameContentSize(compressed: Uint8Array): number | null {
+  if (compressed.length < 6) return null
+
+  const magic =
+    compressed[0] |
+    (compressed[1] << 8) |
+    (compressed[2] << 16) |
+    (compressed[3] << 24)
+  if ((magic >>> 0) !== 0xfd2fb528) return null
+
+  const fhd = compressed[4]
+  const fcsFlag = (fhd >> 6) & 3
+  const singleSegment = (fhd >> 5) & 1
+  const dictIdFlag = fhd & 3
+  const dictIdSize = [0, 1, 2, 4][dictIdFlag]
+  const windowDescSize = singleSegment ? 0 : 1
+
+  let fcsFieldSize: number
+  if (fcsFlag === 0) fcsFieldSize = singleSegment ? 1 : 0
+  else if (fcsFlag === 1) fcsFieldSize = 2
+  else if (fcsFlag === 2) fcsFieldSize = 4
+  else fcsFieldSize = 8
+
+  if (fcsFieldSize === 0) return null
+
+  const offset = 5 + windowDescSize + dictIdSize
+  if (compressed.length < offset + fcsFieldSize) return null
+
+  if (fcsFieldSize === 1) return compressed[offset]
+  if (fcsFieldSize === 2) {
+    return (compressed[offset] | (compressed[offset + 1] << 8)) + 256
+  }
+  if (fcsFieldSize === 4) {
+    return (
+      (compressed[offset] |
+        (compressed[offset + 1] << 8) |
+        (compressed[offset + 2] << 16) |
+        (compressed[offset + 3] << 24)) >>>
+      0
+    )
+  }
+  // 8-byte: use DataView for 64-bit (return as Number, safe for chunk sizes)
+  const dv = new DataView(compressed.buffer, compressed.byteOffset + offset, 8)
+  return Number(dv.getBigUint64(0, true))
+}
+
+/**
+ * Read the uncompressed size (nbytes) from a blosc-compressed buffer's header,
+ * without decompressing. Returns null if not a valid blosc buffer.
+ *
+ * Blosc 1.x header (16 bytes, little-endian):
+ *   [1 byte version] [1 byte versionlz] [1 byte flags] [1 byte typesize]
+ *   [4 bytes nbytes] [4 bytes blocksize] [4 bytes cbytes]
+ *
+ * The nbytes field at offset 4 is the uncompressed data size in bytes.
+ */
+export function readBloscFrameContentSize(compressed: Uint8Array): number | null {
+  if (compressed.length < 16) return null
+
+  // Blosc version must be >= 1 (version byte at offset 0)
+  const version = compressed[0]
+  if (version < 1 || version > 2) return null
+
+  // Sanity: typesize at offset 3 should be 1-8 for typical numeric data
+  const typesize = compressed[3]
+  if (typesize === 0 || typesize > 8) return null
+
+  // Read nbytes (uint32 LE) at offset 4
+  const nbytes =
+    (compressed[4] |
+      (compressed[5] << 8) |
+      (compressed[6] << 16) |
+      (compressed[7] << 24)) >>>
+    0
+
+  // Read cbytes (uint32 LE) at offset 12
+  const cbytes =
+    (compressed[12] |
+      (compressed[13] << 8) |
+      (compressed[14] << 16) |
+      (compressed[15] << 24)) >>>
+    0
+
+  // Sanity: cbytes should roughly match the actual buffer size
+  // Allow some slack since the buffer might contain trailing data
+  if (cbytes === 0 || cbytes > compressed.length + 16) return null
+
+  // Sanity: nbytes should be reasonable (> 0, not astronomically large)
+  if (nbytes === 0) return null
+
+  return nbytes
+}
+
+/**
+ * Try to determine the decompressed byte size of a raw chunk without full decoding.
+ *
+ * Hybrid strategy (cheapest first):
+ *  1. Zstd frame header — read FCS field (zero-cost, no decompression)
+ *  2. Blosc header — read nbytes field (zero-cost, no decompression)
+ *  3. Uncompressed check — if raw byte count matches a plausible element count,
+ *     the chunk may be uncompressed (bytes codec only)
+ *  4. Full decode — decode chunk c/0/0/0 using the codec pipeline and count elements
+ *
+ * Returns the decompressed byte size, or null if detection failed.
+ */
+async function probeDecompressedSize<D extends DataType>(
+  rawBytes: Uint8Array,
+  codecMeta: CodecChunkMeta,
+  bytesPerElement: number,
+): Promise<number | null> {
+  // 1. Try zstd header (cheapest — just reads a few bytes)
+  const zstdSize = readZstdFrameContentSize(rawBytes)
+  if (zstdSize != null) return zstdSize
+
+  // 2. Try blosc header
+  const bloscSize = readBloscFrameContentSize(rawBytes)
+  if (bloscSize != null) return bloscSize
+
+  // 3. Check if the raw bytes could be an uncompressed chunk.
+  //    For the bytes codec (no compression), rawBytes.byteLength IS the
+  //    decompressed size. We check whether the codec chain is bytes-only
+  //    (no bytes_to_bytes compression codecs).
+  const hasCompression = codecMeta.codecs.some((c) => {
+    const name = c.name.toLowerCase()
+    // array_to_array codecs (transpose, etc.) don't change byte size
+    // array_to_bytes codecs (bytes, etc.) don't compress
+    // bytes_to_bytes codecs are the compressors
+    return (
+      name === 'gzip' ||
+      name === 'zlib' ||
+      name === 'blosc' ||
+      name === 'zstd' ||
+      name === 'lz4' ||
+      name === 'bz2' ||
+      name === 'lzma' ||
+      name === 'snappy'
+    )
+  })
+  if (!hasCompression) {
+    // No compression codec — raw bytes are the decompressed data
+    return rawBytes.byteLength
+  }
+
+  // 4. Full decode fallback — decode the chunk using the codec pipeline
+  //    This handles any codec (gzip, lz4, etc.) at the cost of one decompression
+  try {
+    const pipeline = create_codec_pipeline({
+      data_type: codecMeta.data_type,
+      shape: codecMeta.chunk_shape,
+      codecs: codecMeta.codecs,
+    })
+    const chunk = await pipeline.decode(rawBytes)
+    const data = chunk.data as unknown as ArrayLike<unknown>
+    return data.length * bytesPerElement
+  } catch {
+    return null
+  }
+}
+
+interface ChunkShapeCandidate {
+  shape: number[]
+  score: number
+}
+
+/**
+ * Infer candidate chunk shapes from the decompressed element count.
+ * Returns an array of candidates sorted by quality score (lower = better).
+ *
+ * Scoring considers:
+ *  1. Closeness to metadata chunk_shape (L1 distance)
+ *  2. Whether each chunk dimension is a power-of-2 (common in scientific imaging)
+ *  3. Whether the chunk dimensions evenly divide the array shape
+ *  4. Whether chunk_x >= chunk_y (OME-Zarr convention for faster-varying dims)
+ */
+export function inferChunkShape(
+  actualElements: number,
+  metadataChunkShape: number[],
+  arrayShape: number[],
+): number[][] {
+  const ndim = metadataChunkShape.length
+  const metaElements = metadataChunkShape.reduce((a, b) => a * b, 1)
+  if (actualElements === metaElements) return [metadataChunkShape]
+
+  const allCandidates: ChunkShapeCandidate[] = []
+  const seen = new Set<string>()
+
+  function isPowerOf2(n: number): boolean {
+    return n > 0 && (n & (n - 1)) === 0
+  }
+
+  function scoreCandidate(shape: number[]): number {
+    // L1 distance from metadata
+    let l1 = 0
+    for (let i = 0; i < shape.length; i++) l1 += Math.abs(shape[i] - metadataChunkShape[i])
+
+    // Penalty for non-power-of-2 dimensions
+    let pow2Penalty = 0
+    for (let i = 0; i < shape.length; i++) {
+      if (!isPowerOf2(shape[i])) pow2Penalty += 10
+    }
+
+    // Penalty for not evenly dividing array shape
+    let divPenalty = 0
+    for (let i = 0; i < shape.length; i++) {
+      if (arrayShape[i] % shape[i] !== 0) divPenalty += 5
+    }
+
+    // Penalty for chunk dim > array dim (invalid)
+    let overPenalty = 0
+    for (let i = 0; i < shape.length; i++) {
+      if (shape[i] > arrayShape[i]) overPenalty += 1000
+    }
+
+    // OME-Zarr convention: for 3D (z,y,x), prefer chunk_x >= chunk_y
+    let conventionPenalty = 0
+    if (ndim >= 2) {
+      const lastDim = shape[ndim - 1] // x
+      const prevDim = shape[ndim - 2] // y
+      if (lastDim < prevDim) conventionPenalty += 20
+    }
+
+    return l1 + pow2Penalty + divPenalty + overPenalty + conventionPenalty
+  }
+
+  function addCandidate(shape: number[]): void {
+    const key = shape.join(',')
+    if (seen.has(key)) return
+    seen.add(key)
+    allCandidates.push({ shape, score: scoreCandidate(shape) })
+  }
+
+  // Strategy 1: Keep all but one dimension from metadata, solve for the remaining
+  for (let vary = 0; vary < ndim; vary++) {
+    const fixedProduct = metadataChunkShape.reduce(
+      (acc, v, i) => (i === vary ? acc : acc * v),
+      1,
+    )
+    if (fixedProduct === 0 || actualElements % fixedProduct !== 0) continue
+    const candidate = actualElements / fixedProduct
+    if (candidate > 0 && candidate <= arrayShape[vary] && Number.isInteger(candidate)) {
+      const result = [...metadataChunkShape]
+      result[vary] = candidate
+      addCandidate(result)
+    }
+  }
+
+  // Strategy 2: For 3D arrays, try common chunk sizes for two dimensions, solve for third
+  if (ndim === 3) {
+    const commonSizes = [256, 128, 96, 64, 48, 32]
+    for (const cy of commonSizes) {
+      if (cy > arrayShape[1] || actualElements % cy !== 0) continue
+      for (const cx of commonSizes) {
+        if (cx > arrayShape[2]) continue
+        const yx = cy * cx
+        if (actualElements % yx !== 0) continue
+        const cz = actualElements / yx
+        if (cz > 0 && cz <= arrayShape[0] && Number.isInteger(cz)) {
+          addCandidate([cz, cy, cx])
+        }
+      }
+    }
+  }
+
+  // Strategy 3: Try adjusting one dim by small delta, solve for other two
+  if (ndim === 3) {
+    const deltas = [1, -1, 2, -2, 3, -3]
+    const commonSizes = [256, 128, 96, 64, 48, 32]
+    for (let vary = 0; vary < ndim; vary++) {
+      for (const delta of deltas) {
+        const trial = metadataChunkShape[vary] + delta
+        if (trial <= 0 || trial > arrayShape[vary]) continue
+        if (actualElements % trial !== 0) continue
+        const remaining = actualElements / trial
+        const otherDims: number[] = []
+        for (let d = 0; d < ndim; d++) {
+          if (d !== vary) otherDims.push(d)
+        }
+        const [d1, d2] = otherDims
+        for (const s1 of commonSizes) {
+          if (s1 > arrayShape[d1] || remaining % s1 !== 0) continue
+          const s2 = remaining / s1
+          if (s2 > 0 && s2 <= arrayShape[d2] && Number.isInteger(s2)) {
+            const result = [...metadataChunkShape]
+            result[vary] = trial
+            result[d1] = s1
+            result[d2] = s2
+            addCandidate(result)
+          }
+        }
+      }
+    }
+  }
+
+  // Sort by quality score (lower = better)
+  allCandidates.sort((a, b) => a.score - b.score)
+  return allCandidates.map((c) => c.shape)
+}
+
+/**
+ * Detect actual chunk shape by probing the first chunk's decompressed size
+ * and using heuristic scoring to infer the most likely chunk shape.
+ *
+ * Uses a hybrid approach to determine decompressed size:
+ *  1. Zstd frame header (zero-cost)
+ *  2. Blosc header (zero-cost)
+ *  3. Raw size check for uncompressed data (zero-cost)
+ *  4. Full decode fallback for any other codec (one decompression)
+ *
+ * Returns the corrected chunk shape, or the metadata chunk shape if no
+ * correction is needed or possible.
+ */
+async function probeActualChunkShape<D extends DataType, Store extends Readable>(
+  arr: ZarrArray<D, Store>,
+  encodeChunkKey: (chunk_coords: number[]) => string,
+  codecMeta: CodecChunkMeta,
+  bytesPerElement: number,
+  storeOpts?: Parameters<Store['get']>[1],
+): Promise<number[]> {
+  const metadataChunkShape = codecMeta.chunk_shape
+  const metaElements = metadataChunkShape.reduce((a, b) => a * b, 1)
+
+  // Fetch the first chunk (c/0/0/0)
+  const zeroCoords = metadataChunkShape.map(() => 0)
+  const chunkKey = encodeChunkKey(zeroCoords)
+  const chunkPath = arr.resolve(chunkKey).path
+
+  try {
+    const rawBytes = await arr.store.get(chunkPath, storeOpts)
+    if (!rawBytes) return metadataChunkShape
+
+    // Determine decompressed size via hybrid strategy
+    const decompressedBytes = await probeDecompressedSize(rawBytes, codecMeta, bytesPerElement)
+    if (decompressedBytes == null) return metadataChunkShape
+
+    const actualElements = decompressedBytes / bytesPerElement
+    if (actualElements === metaElements) return metadataChunkShape
+
+    // Mismatch detected — infer chunk shape from element count + heuristics
+    const candidates = inferChunkShape(actualElements, metadataChunkShape, arr.shape)
+    if (candidates.length === 0) return metadataChunkShape
+
+    // Use the best-scoring candidate
+    const inferred = candidates[0]
+    console.warn(
+      `[fizarrita] Metadata chunk_shape ${JSON.stringify(metadataChunkShape)} ` +
+        `does not match actual chunk data (${actualElements} elements). ` +
+        `Using inferred chunk_shape: ${JSON.stringify(inferred)}`,
+    )
+    return inferred
+  } catch {
+    return metadataChunkShape
+  }
+}
+
+// ---------------------------------------------------------------------------
 // getWorker
 // ---------------------------------------------------------------------------
 
@@ -168,17 +535,25 @@ export async function getWorker<
   // Read metadata from store — single read, single parse
   const { codecMeta, encodeChunkKey, fillValue } = await readArrayMetadata(arr)
 
-  // Get stable metaId for the codec metadata (used by worker-rpc meta-init)
-  const metaId = getMetaId(codecMeta)
-
   const Ctr = get_ctr(arr.dtype)
   const bytesPerElement = (Ctr as unknown as { BYTES_PER_ELEMENT: number }).BYTES_PER_ELEMENT
 
-  // Set up the indexer
+  // Probe actual chunk shape — detects metadata vs data mismatch
+  const actualChunkShape = await probeActualChunkShape(arr, encodeChunkKey, codecMeta, bytesPerElement, opts.opts)
+
+  // Update codecMeta to use the actual chunk shape for codec pipeline
+  const correctedCodecMeta = actualChunkShape !== codecMeta.chunk_shape
+    ? { ...codecMeta, chunk_shape: actualChunkShape }
+    : codecMeta
+
+  // Get stable metaId for the codec metadata (used by worker-rpc meta-init)
+  const metaId = getMetaId(correctedCodecMeta)
+
+  // Set up the indexer with the actual (possibly corrected) chunk shape
   const indexer = new BasicIndexer({
     selection,
     shape: arr.shape,
-    chunk_shape: arr.chunks,
+    chunk_shape: actualChunkShape,
   })
 
   // Allocate output — backed by SharedArrayBuffer when requested
@@ -189,9 +564,7 @@ export async function getWorker<
   const out = setter.prepare(data, indexer.shape, outStride) as Chunk<D>
 
   // Pre-compute chunk invariants (hoisted out of loop)
-  const chunkShape = arr.chunks
-  const chunkStrides = get_strides(chunkShape)
-  const chunkSize = chunkShape.reduce((a: number, b: number) => a * b, 1)
+  const chunkShape = actualChunkShape
 
   // Build tasks — one per chunk
   const tasks: WorkerPoolTask<void>[] = []
@@ -200,11 +573,11 @@ export async function getWorker<
     const chunkKey = encodeChunkKey(chunk_coords)
     const chunkPath = arr.resolve(chunkKey).path
 
-    // Compute actual chunk shape for edge chunks: min(chunk_shape[d], array_shape[d] - coord * chunk_shape[d])
-    const actualChunkShape = chunk_coords.map((coord, dim) =>
+    // Compute edge chunk shape: min(chunk_shape[d], array_shape[d] - coord * chunk_shape[d])
+    const edgeChunkShape = chunk_coords.map((coord, dim) =>
       Math.min(chunkShape[dim], arr.shape[dim] - coord * chunkShape[dim]),
     )
-    const isEdgeChunk = actualChunkShape.some((s, i) => s !== chunkShape[i])
+    const isEdgeChunk = edgeChunkShape.some((s, i) => s !== chunkShape[i])
 
     tasks.push(async (workerSlot: Worker | null) => {
       const worker = workerSlot ?? new Worker(resolvedWorkerUrl, { type: 'module' })
@@ -214,7 +587,7 @@ export async function getWorker<
 
       if (!rawBytes) {
         // Missing chunk — fill value, no worker needed
-        const fillChunkShape = actualChunkShape
+        const fillChunkShape = edgeChunkShape
         const fillChunkStrides = get_strides(fillChunkShape)
         const fillChunkSize = fillChunkShape.reduce((a: number, b: number) => a * b, 1)
         const chunkData = new Ctr(fillChunkSize)
@@ -237,13 +610,13 @@ export async function getWorker<
             worker,
             rawBytes,
             metaId,
-            codecMeta,
+            correctedCodecMeta,
             buffer as SharedArrayBuffer,
             size * bytesPerElement,
             outStride,
             mapping,
             bytesPerElement,
-            isEdgeChunk ? actualChunkShape : undefined,
+            isEdgeChunk ? edgeChunkShape : undefined,
           )
         } catch (error) {
           worker.terminate()
@@ -253,7 +626,7 @@ export async function getWorker<
         // Standard path: worker decodes, transfers back, main thread copies
         let chunk: Chunk<D>
         try {
-          chunk = await workerDecode<D>(worker, rawBytes, metaId, codecMeta, isEdgeChunk ? actualChunkShape : undefined)
+          chunk = await workerDecode<D>(worker, rawBytes, metaId, correctedCodecMeta, isEdgeChunk ? edgeChunkShape : undefined)
         } catch (error) {
           worker.terminate()
           throw error

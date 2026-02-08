@@ -6,7 +6,7 @@
  * WorkerPool with bounded concurrency.
  */
 
-export { getWorker } from './get-worker.js'
+export { getWorker, readZstdFrameContentSize, readBloscFrameContentSize, inferChunkShape } from './get-worker.js'
 export { setWorker } from './set-worker.js'
 export type {
   GetWorkerOptions,
