@@ -424,6 +424,61 @@ export function inferChunkShape(
 }
 
 /**
+ * Validate a candidate chunk shape by probing one-past-the-end along the
+ * dimension with the smallest grid extent. If the probe returns data, the
+ * candidate's chunks are too large (the real grid has more chunks in that
+ * dimension) and should be rejected.
+ *
+ * Returns true if the candidate is valid (probe returned 404/empty),
+ * false if invalid (probe returned data, meaning chunks are too coarse).
+ */
+async function validateCandidateChunkShape<D extends DataType, Store extends Readable>(
+  arr: ZarrArray<D, Store>,
+  encodeChunkKey: (chunk_coords: number[]) => string,
+  candidate: number[],
+  storeOpts?: Parameters<Store['get']>[1],
+): Promise<boolean> {
+  const ndim = candidate.length
+
+  // Compute grid dimensions and find the dimension with the smallest extent > 1
+  // (most likely to differ between wrong and correct candidates)
+  const gridDims = candidate.map((c, i) => Math.ceil(arr.shape[i] / c))
+
+  // Find a dimension where gridDims > 1 to probe one-past-the-end
+  // Prefer the dimension with the smallest grid extent (fewest chunks),
+  // as that's where over-sized chunks are most detectable
+  let probeDim = -1
+  let minGrid = Infinity
+  for (let i = 0; i < ndim; i++) {
+    if (gridDims[i] > 1 && gridDims[i] < minGrid) {
+      minGrid = gridDims[i]
+      probeDim = i
+    }
+  }
+
+  if (probeDim === -1) {
+    // All dimensions have only 1 chunk — can't validate, assume correct
+    return true
+  }
+
+  // Probe one-past-the-end: if the store has a chunk at this coordinate,
+  // the candidate's chunks are too large (real grid is finer)
+  const probeCoords = candidate.map(() => 0)
+  probeCoords[probeDim] = gridDims[probeDim] // one past last valid index
+  const probeKey = encodeChunkKey(probeCoords)
+  const probePath = arr.resolve(probeKey).path
+
+  try {
+    const probeBytes = await arr.store.get(probePath, storeOpts)
+    // If data returned, there's a chunk beyond our expected grid → reject
+    return !probeBytes
+  } catch {
+    // Fetch error (404, network error) → no chunk there → accept
+    return true
+  }
+}
+
+/**
  * Detect actual chunk shape by probing the first chunk's decompressed size
  * and using heuristic scoring to infer the most likely chunk shape.
  *
@@ -432,6 +487,10 @@ export function inferChunkShape(
  *  2. Blosc header (zero-cost)
  *  3. Raw size check for uncompressed data (zero-cost)
  *  4. Full decode fallback for any other codec (one decompression)
+ *
+ * After inference, validates the top candidate by probing one-past-the-end
+ * along its smallest grid dimension. If the store has a chunk beyond the
+ * candidate's expected grid, the candidate is rejected in favor of the next.
  *
  * Returns the corrected chunk shape, or the metadata chunk shape if no
  * correction is needed or possible.
@@ -466,14 +525,31 @@ async function probeActualChunkShape<D extends DataType, Store extends Readable>
     const candidates = inferChunkShape(actualElements, metadataChunkShape, arr.shape)
     if (candidates.length === 0) return metadataChunkShape
 
-    // Use the best-scoring candidate
-    const inferred = candidates[0]
+    // Validate candidates by probing one-past-the-end.
+    // The first candidate that passes validation wins.
+    // Limit validation attempts to avoid excessive network requests.
+    const maxValidationAttempts = Math.min(candidates.length, 5)
+    for (let i = 0; i < maxValidationAttempts; i++) {
+      const candidate = candidates[i]
+      const isValid = await validateCandidateChunkShape(arr, encodeChunkKey, candidate, storeOpts)
+      if (isValid) {
+        console.warn(
+          `[fizarrita] Metadata chunk_shape ${JSON.stringify(metadataChunkShape)} ` +
+            `does not match actual chunk data (${actualElements} elements). ` +
+            `Using inferred chunk_shape: ${JSON.stringify(candidate)}`,
+        )
+        return candidate
+      }
+    }
+
+    // No candidate passed validation — fall back to best-scored
+    const fallback = candidates[0]
     console.warn(
       `[fizarrita] Metadata chunk_shape ${JSON.stringify(metadataChunkShape)} ` +
         `does not match actual chunk data (${actualElements} elements). ` +
-        `Using inferred chunk_shape: ${JSON.stringify(inferred)}`,
+        `Using inferred chunk_shape: ${JSON.stringify(fallback)} (unvalidated)`,
     )
-    return inferred
+    return fallback
   } catch {
     return metadataChunkShape
   }

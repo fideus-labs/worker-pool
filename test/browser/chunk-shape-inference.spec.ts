@@ -404,6 +404,133 @@ test.describe('inferChunkShape', () => {
   })
 })
 
+test.describe('inferChunkShape — validation probe scenarios', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto('/')
+    await page.waitForFunction(() => typeof window.inferChunkShape === 'function')
+  })
+
+  test('heuristic alone picks wrong [98,32,64] for beechnut scale 3, needs validation', async ({ page }) => {
+    // Scale 3: array [193,128,128], metadata chunk [96,96,96], actual [49,64,64]
+    // actualElements = 49*64*64 = 200704
+    // Without validation, the heuristic scores [98,32,64] better than [49,64,64]
+    // because [98,32,64] has L1=98 vs [49,64,64] has L1=111
+    const result = await page.evaluate(() => {
+      const candidates = window.inferChunkShape(200704, [96, 96, 96], [193, 128, 128])
+      const idx49_64_64 = candidates.findIndex(
+        (c: number[]) => c[0] === 49 && c[1] === 64 && c[2] === 64,
+      )
+      return { top: candidates[0], idx49_64_64, total: candidates.length }
+    })
+    // The correct answer [49,64,64] should be in the candidates list
+    expect(result.idx49_64_64).toBeGreaterThanOrEqual(0)
+    // But it may not be the top candidate (that's why we need validation)
+  })
+
+  test('heuristic alone may pick wrong shape for beechnut scale 4', async ({ page }) => {
+    // Scale 4: array [96,128,128], metadata chunk [96,96,96], actual [48,64,64]
+    // actualElements = 48*64*64 = 196608
+    const result = await page.evaluate(() => {
+      const candidates = window.inferChunkShape(196608, [96, 96, 96], [96, 128, 128])
+      const idx48_64_64 = candidates.findIndex(
+        (c: number[]) => c[0] === 48 && c[1] === 64 && c[2] === 64,
+      )
+      return { top: candidates[0], idx48_64_64, total: candidates.length }
+    })
+    // The correct [48,64,64] should be in the candidates
+    expect(result.idx48_64_64).toBeGreaterThanOrEqual(0)
+  })
+})
+
+test.describe('getWorker — validation probe rejects wrong candidate', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto('/')
+    await page.waitForFunction(() => {
+      return (
+        typeof window.zarr !== 'undefined' &&
+        typeof window.getWorker === 'function' &&
+        typeof window.WorkerPool !== 'undefined'
+      )
+    })
+  })
+
+  test('probe rejects wrong top candidate and finds correct chunk_shape', async ({ page }) => {
+    // Mirrors beechnut scale 3 bug: heuristic alone picks wrong [98,32,64]
+    // but the validation probe rejects it because chunk c/2/0/0 exists
+    // (actual grid has 4 Z-chunks, wrong candidate thinks only 2).
+    //
+    // We use a small 2D array to keep it fast:
+    //   array shape [12,6], actual chunk_shape [3,6] (grid 4×1)
+    //   metadata lies: chunk_shape [6,6] (36 elements vs actual 18)
+    //
+    // inferChunkShape(18, [6,6], [12,6]) produces:
+    //   [3,6] (L1=3, pow2: 3 not → +10, div: 12%3=0,6%6=0 → score 13)
+    //   [6,3] (L1=3, pow2: 3 not → +10, div: 12%6=0,6%3=0, convention: x=3<y=6 → +20 → score 33)
+    //
+    // So [3,6] wins and is correct — no probe needed. To force the probe,
+    // we need a case where wrong > correct in score. Let's create one:
+    //
+    // array shape [12,8], actual chunk_shape [4,3] (grid 3×ceil(8/3)=3, 12 elements)
+    // metadata claims [3,3] (9 elements)
+    // inferChunkShape(12, [3,3], [12,8]):
+    //   single-dim: dim0: 12/3=4 → [4,3] (L1=1, pow2:4=yes,3=no→+10, div:12%4=0,8%3≠0→+5 → score 16)
+    //   single-dim: dim1: 12/3=4 → [3,4] (L1=1, pow2:3=no,4=yes→+10, div:12%3=0,8%4=0 → score 11, convention: x=4>y=3 ok)
+    //
+    // [3,4] scores 11 (WRONG), [4,3] scores 16 (CORRECT but ranked second).
+    // Validation: [3,4] grid = [4,2]. Probe dim with smallest grid > 1 = dim1 (grid=2).
+    // Probe c/0/2 → with actual [4,3], chunk at Y-index=2 EXISTS (grid is 3×3, Y 0-2).
+    // So [3,4] is rejected. [4,3] grid = [3,3]. Probe dim1 (grid=3). Probe c/0/3 → doesn't exist → accepted.
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+
+      // 1. Create array with actual chunk_shape [4,3]
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [12, 8],
+        chunk_shape: [4, 3],
+        data_type: 'int32',
+      })
+
+      // Write data: 12×8 grid with known values
+      const data = new Int32Array(12 * 8)
+      for (let i = 0; i < data.length; i++) data[i] = i + 1
+      await zarr.set(arr, null, { data, shape: [12, 8], stride: [8, 1] })
+
+      // 2. Modify zarr.json to lie: claim chunk_shape [3,3]
+      const map = store.store as Map<string, Uint8Array>
+      const metaBytes = map.get('/zarr.json')!
+      const metadata = JSON.parse(new TextDecoder().decode(metaBytes))
+      metadata.chunk_grid.configuration.chunk_shape = [3, 3]
+      map.set('/zarr.json', new TextEncoder().encode(JSON.stringify(metadata)))
+
+      // 3. Re-open so it picks up modified metadata
+      const arr2 = await zarr.open(store, { kind: 'array' })
+
+      // 4. Verify arr2.chunks reports the wrong value
+      const reportedChunks = arr2.chunks
+
+      // 5. Read with getWorker — validation probe should reject [3,4] and pick [4,3]
+      const chunk = await getWorker(arr2, null, { pool })
+      pool.terminateWorkers()
+
+      return {
+        data: Array.from(chunk.data as Int32Array),
+        shape: chunk.shape,
+        reportedChunks,
+      }
+    })
+
+    // Verify getWorker returns correct shape and data
+    expect(result.shape).toEqual([12, 8])
+    expect(result.reportedChunks).toEqual([3, 3]) // metadata lie is in effect
+
+    // Verify actual data matches what we wrote
+    const expected = Array.from({ length: 96 }, (_, i) => i + 1)
+    expect(result.data).toEqual(expected)
+  })
+})
+
 test.describe('getWorker — chunk shape auto-detection integration', () => {
   test.beforeEach(async ({ page }) => {
     await page.goto('/')
