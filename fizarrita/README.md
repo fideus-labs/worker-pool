@@ -51,6 +51,7 @@ const chunk = await getWorker(arr, [zarr.slice(0, 10)], { pool })
 | `workerUrl` | `string \| URL` | built-in | URL of the codec worker script |
 | `opts` | `StoreOpts` | — | Pass-through options for the store's `get` method |
 | `useSharedArrayBuffer` | `boolean` | `false` | Allocate output on SharedArrayBuffer with decode-into-shared optimization |
+| `cache` | `ChunkCache` | — | Optional decoded-chunk cache to avoid redundant decompression |
 
 ### `setWorker(arr, selection, value, options)`
 
@@ -115,6 +116,68 @@ export default defineConfig({
 
 If the headers are missing, `useSharedArrayBuffer: true` throws with a
 descriptive error.
+
+## Chunk caching
+
+`getWorker` accepts an optional `cache` to store decoded chunks. On repeated
+calls the cache skips fetching and decompression entirely, returning the cached
+chunk directly on the main thread.
+
+Any object with `get(key)` and `set(key, value)` works — a plain `Map` is the
+simplest option:
+
+```ts
+const cache = new Map()
+
+// First call — fetches, decodes, and caches each chunk
+const a = await getWorker(arr, null, { pool, cache })
+
+// Second call — all chunks served from cache, no workers used
+const b = await getWorker(arr, null, { pool, cache })
+```
+
+Cache keys use the format `store_N:/array/path:c/0/1/2`. A `WeakMap`-based
+store ID ensures keys are unique across store instances, so a single cache can
+safely be shared across multiple arrays and stores.
+
+### LRU / bounded caches
+
+For bounded memory, pass any LRU cache that implements the same `get`/`set`
+interface:
+
+```ts
+import { LRUCache } from 'lru-cache'
+
+const cache = new LRUCache({ max: 200 })
+const chunk = await getWorker(arr, [zarr.slice(0, 10)], { pool, cache })
+```
+
+### When caching helps
+
+Caching is most beneficial when:
+
+- **Overlapping selections** — e.g. iterating over z-slices where chunks span
+  many slices. Without a cache, the same chunk is decompressed for every slice
+  that touches it.
+- **Repeated reads** — re-reading the same region of an array (panning/zooming
+  in a viewer, re-rendering a frame).
+- **Large compressed chunks** — decompression dominates I/O latency, so
+  avoiding it yields significant speedups.
+
+When `useSharedArrayBuffer` is combined with `cache`, cache misses use the
+standard decode path (worker returns the decoded chunk via transfer) so the
+chunk can be stored in the cache. Cache hits copy the cached chunk into the
+SharedArrayBuffer output on the main thread. The small overhead on first access
+is repaid by subsequent cache hits that bypass workers entirely.
+
+### `ChunkCache` interface
+
+```ts
+interface ChunkCache {
+  get(key: string): Chunk<DataType> | undefined
+  set(key: string, value: Chunk<DataType>): void
+}
+```
 
 ## Worker message protocol
 
