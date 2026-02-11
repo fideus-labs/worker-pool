@@ -98,7 +98,9 @@ export async function runBenchmark(
 
   // Determine total steps for progress tracking
   const totalOps = config.operations.length
-  const variantsPerOp = config.useSharedArrayBuffer ? 3 : 2 // vanilla+worker [+worker-sab]
+  let variantsPerOp = 2 // vanilla + worker
+  if (config.useSharedArrayBuffer) variantsPerOp++
+  if (config.useChunkCache) variantsPerOp++
   const totalStepsPerOp = (config.warmupRuns + config.iterations) * variantsPerOp
   const totalSteps = totalOps * totalStepsPerOp
   let currentStep = 0
@@ -232,6 +234,35 @@ export async function runBenchmark(
           operation: 'read',
           variant: 'worker-sab',
           stats: computeStats(sabTimes),
+        })
+      }
+
+      // --- Worker + Chunk Cache read ---
+      if (config.useChunkCache) {
+        const cacheTimes: number[] = []
+        const cache = new Map()
+
+        // Warmup — these iterations populate the cache
+        for (let i = 0; i < config.warmupRuns; i++) {
+          checkAbort()
+          await getWorker(readArr, null, { pool, workerUrl, cache })
+          report('warmup', 'read', 'worker-cache', i + 1, config.warmupRuns)
+        }
+
+        // Timed — all iterations hit a fully-populated cache
+        for (let i = 0; i < config.iterations; i++) {
+          checkAbort()
+          const ms = await timeAsync(() =>
+            getWorker(readArr, null, { pool, workerUrl, cache }).then(() => {}),
+          )
+          cacheTimes.push(ms)
+          report('benchmark', 'read', 'worker-cache', i + 1, config.iterations)
+        }
+
+        results.push({
+          operation: 'read',
+          variant: 'worker-cache',
+          stats: computeStats(cacheTimes),
         })
       }
     }

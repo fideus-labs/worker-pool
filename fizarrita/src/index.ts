@@ -12,4 +12,5 @@ export type {
   GetWorkerOptions,
   SetWorkerOptions,
   CodecChunkMeta,
+  ChunkCache,
 } from './types.js'

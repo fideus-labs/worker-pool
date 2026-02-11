@@ -80,8 +80,9 @@
         </label>
         <div class="checkbox-group" style="margin-top: 10px">
           <label><input type="checkbox" id="opt-sab" checked /> Use SharedArrayBuffer</label>
+          <label><input type="checkbox" id="opt-cache" /> Use Chunk Cache</label>
         </div>
-        <p class="hint">Adds a "Worker + SAB" variant using decode-into-shared optimization.</p>
+        <p class="hint">SAB adds a "Worker + SAB" variant. Cache adds a "Worker + Cache" variant measuring pre-populated cache reads.</p>
       </fieldset>
 
       <!-- Iterations -->

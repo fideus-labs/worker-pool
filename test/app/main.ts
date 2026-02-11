@@ -68,7 +68,7 @@ import type {
 
 import * as zarr from 'zarrita'
 import { getWorker, setWorker, readZstdFrameContentSize, readBloscFrameContentSize, inferChunkShape } from '../../fizarrita/src/index.js'
-import type { GetWorkerOptions, SetWorkerOptions } from '../../fizarrita/src/index.js'
+import type { GetWorkerOptions, SetWorkerOptions, ChunkCache } from '../../fizarrita/src/index.js'
 
 // Expose helpers on the window so Playwright tests can call them.
 declare global {

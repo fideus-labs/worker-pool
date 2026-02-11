@@ -1699,4 +1699,529 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
     expect(result.sabMatch).toBe(true)
   })
 
+  // -------------------------------------------------------------------------
+  // Chunk caching
+  // -------------------------------------------------------------------------
+
+  test('getWorker works without cache (default, unchanged behavior)', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [4, 4],
+        chunk_shape: [2, 2],
+        data_type: 'int32',
+      })
+
+      const data = new Int32Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+      await zarr.set(arr, null, { data, shape: [4, 4], stride: [4, 1] })
+
+      // No cache option — default behavior
+      const chunk = await getWorker(arr, null, { pool })
+      pool.terminateWorkers()
+
+      return {
+        data: Array.from(chunk.data as Int32Array),
+        shape: chunk.shape,
+      }
+    })
+
+    expect(result.data).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+    expect(result.shape).toEqual([4, 4])
+  })
+
+  test('getWorker with Map cache returns correct data and populates cache', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [4, 4],
+        chunk_shape: [2, 2],
+        data_type: 'int32',
+      })
+
+      const data = new Int32Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+      await zarr.set(arr, null, { data, shape: [4, 4], stride: [4, 1] })
+
+      const cache = new Map()
+
+      // First call — populates cache
+      const chunk1 = await getWorker(arr, null, { pool, cache })
+      const cacheSize = cache.size
+
+      // Second call — uses cache
+      const chunk2 = await getWorker(arr, null, { pool, cache })
+
+      pool.terminateWorkers()
+
+      return {
+        data1: Array.from(chunk1.data as Int32Array),
+        data2: Array.from(chunk2.data as Int32Array),
+        shape: chunk1.shape,
+        cacheSizeAfterFirst: cacheSize,
+        cacheSizeAfterSecond: cache.size,
+      }
+    })
+
+    expect(result.data1).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+    expect(result.data2).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+    expect(result.shape).toEqual([4, 4])
+    // 4 chunks for a [4,4] array with [2,2] chunk shape
+    expect(result.cacheSizeAfterFirst).toBe(4)
+    expect(result.cacheSizeAfterSecond).toBe(4)
+  })
+
+  test('cache keys use store_N:/path:chunkKey format', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [4],
+        chunk_shape: [2],
+        data_type: 'int32',
+      })
+
+      await zarr.set(arr, null, {
+        data: new Int32Array([10, 20, 30, 40]),
+        shape: [4],
+        stride: [1],
+      })
+
+      const cache = new Map()
+      await getWorker(arr, null, { pool, cache })
+      pool.terminateWorkers()
+
+      return {
+        keys: Array.from(cache.keys()),
+      }
+    })
+
+    expect(result.keys.length).toBe(2)
+    for (const key of result.keys) {
+      // Pattern: store_N:/path:c/digit  (path may be just "/")
+      expect(key).toMatch(/^store_\d+:\/[^:]*:c\/\d+$/)
+    }
+  })
+
+  test('cached reads skip chunk fetches on second call', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [4],
+        chunk_shape: [2],
+        data_type: 'int32',
+      })
+
+      await zarr.set(arr, null, {
+        data: new Int32Array([10, 20, 30, 40]),
+        shape: [4],
+        stride: [1],
+      })
+
+      // Instrument store.get to track chunk-key reads (c/0, c/1, etc.)
+      const originalGet = arr.store.get.bind(arr.store)
+      const chunkPaths: string[] = []
+      ;(arr.store as any).get = (path: string, ...rest: any[]) => {
+        if (path.includes('/c/')) chunkPaths.push(path)
+        return originalGet(path, ...rest)
+      }
+
+      const cache = new Map()
+
+      // First call — cache miss, triggers chunk reads (probe + 2 data chunks)
+      await getWorker(arr, null, { pool, cache })
+      const firstCallChunkReads = chunkPaths.length
+
+      // Reset tracker
+      chunkPaths.length = 0
+
+      // Second call — all chunks cached, only the shape probe hits the store
+      await getWorker(arr, null, { pool, cache })
+      const secondCallChunkReads = chunkPaths.length
+
+      pool.terminateWorkers()
+
+      return {
+        firstCallChunkReads,
+        secondCallChunkReads,
+      }
+    })
+
+    // First call reads chunks: 1 probe + 2 data chunks = 3
+    expect(result.firstCallChunkReads).toBeGreaterThanOrEqual(2)
+    // Second call: only the shape probe read, NO data chunk reads
+    // (probe reads c/0 for shape detection, but no per-chunk task reads)
+    expect(result.secondCallChunkReads).toBeLessThan(result.firstCallChunkReads)
+  })
+
+  test('custom cache implementation receives get/set calls', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [4],
+        chunk_shape: [2],
+        data_type: 'int32',
+      })
+
+      await zarr.set(arr, null, {
+        data: new Int32Array([10, 20, 30, 40]),
+        shape: [4],
+        stride: [1],
+      })
+
+      // Custom cache that tracks operations
+      const ops: string[] = []
+      const backing = new Map()
+      const cache = {
+        get(key: string) {
+          ops.push(`get:${key}`)
+          return backing.get(key)
+        },
+        set(key: string, value: any) {
+          ops.push(`set:${key}`)
+          backing.set(key, value)
+        },
+      }
+
+      // First call: get (miss) then set
+      await getWorker(arr, null, { pool, cache })
+      const opsAfterFirst = [...ops]
+
+      // Second call: get (hit)
+      await getWorker(arr, null, { pool, cache })
+
+      pool.terminateWorkers()
+
+      return {
+        opsAfterFirst,
+        opsAll: ops,
+        hasGetOps: ops.some(o => o.startsWith('get:')),
+        hasSetOps: ops.some(o => o.startsWith('set:')),
+      }
+    })
+
+    expect(result.hasGetOps).toBe(true)
+    expect(result.hasSetOps).toBe(true)
+    // First call: 2 get misses + 2 set calls = 4 ops
+    expect(result.opsAfterFirst.length).toBe(4)
+    // Second call: 2 get hits (no sets since already cached)
+    expect(result.opsAll.length).toBe(6)
+  })
+
+  test('cache with sliced access shares cached chunks', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [4, 4],
+        chunk_shape: [2, 2],
+        data_type: 'int32',
+      })
+
+      const data = new Int32Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+      await zarr.set(arr, null, { data, shape: [4, 4], stride: [4, 1] })
+
+      const cache = new Map()
+
+      // Access first two rows (overlaps with chunks at row indices 0..1)
+      const slice1 = await getWorker(arr, [zarr.slice(0, 2), null], { pool, cache })
+      const cacheAfterSlice1 = cache.size
+
+      // Access last two rows (overlaps with chunks at row indices 2..3)
+      const slice2 = await getWorker(arr, [zarr.slice(2, 4), null], { pool, cache })
+      const cacheAfterSlice2 = cache.size
+
+      // Access all rows — all chunks should be cached now
+      const full = await getWorker(arr, null, { pool, cache })
+      const cacheAfterFull = cache.size
+
+      pool.terminateWorkers()
+
+      return {
+        slice1Data: Array.from(slice1.data as Int32Array),
+        slice1Shape: slice1.shape,
+        slice2Data: Array.from(slice2.data as Int32Array),
+        slice2Shape: slice2.shape,
+        fullData: Array.from(full.data as Int32Array),
+        cacheAfterSlice1,
+        cacheAfterSlice2,
+        cacheAfterFull,
+      }
+    })
+
+    expect(result.slice1Data).toEqual([1, 2, 3, 4, 5, 6, 7, 8])
+    expect(result.slice1Shape).toEqual([2, 4])
+    expect(result.slice2Data).toEqual([9, 10, 11, 12, 13, 14, 15, 16])
+    expect(result.slice2Shape).toEqual([2, 4])
+    expect(result.fullData).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+    // First slice touches 2 chunks, second slice adds 2 more = 4 total
+    expect(result.cacheAfterSlice1).toBe(2)
+    expect(result.cacheAfterSlice2).toBe(4)
+    // Full access should not add more cache entries (all 4 already cached)
+    expect(result.cacheAfterFull).toBe(4)
+  })
+
+  test('different arrays have separate cache entries', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+
+      const store = zarr.root()
+
+      const arr1 = await zarr.create(store.resolve('/arr1'), {
+        shape: [4],
+        chunk_shape: [4],
+        data_type: 'int32',
+      })
+      await zarr.set(arr1, null, {
+        data: new Int32Array([1, 2, 3, 4]),
+        shape: [4],
+        stride: [1],
+      })
+
+      const arr2 = await zarr.create(store.resolve('/arr2'), {
+        shape: [4],
+        chunk_shape: [4],
+        data_type: 'int32',
+      })
+      await zarr.set(arr2, null, {
+        data: new Int32Array([10, 20, 30, 40]),
+        shape: [4],
+        stride: [1],
+      })
+
+      const cache = new Map()
+
+      await getWorker(arr1, null, { pool, cache })
+      await getWorker(arr2, null, { pool, cache })
+
+      const keys = Array.from(cache.keys())
+
+      pool.terminateWorkers()
+
+      return {
+        keys,
+        cacheSize: cache.size,
+        hasArr1Key: keys.some(k => k.includes('/arr1:')),
+        hasArr2Key: keys.some(k => k.includes('/arr2:')),
+      }
+    })
+
+    expect(result.cacheSize).toBe(2)
+    expect(result.hasArr1Key).toBe(true)
+    expect(result.hasArr2Key).toBe(true)
+  })
+
+  test('different stores have separate cache entries (store ID isolation)', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+
+      // Two separate stores
+      const store1 = zarr.root()
+      const arr1 = await zarr.create(store1, {
+        shape: [4],
+        chunk_shape: [4],
+        data_type: 'int32',
+      })
+      await zarr.set(arr1, null, {
+        data: new Int32Array([1, 2, 3, 4]),
+        shape: [4],
+        stride: [1],
+      })
+
+      const store2 = zarr.root()
+      const arr2 = await zarr.create(store2, {
+        shape: [4],
+        chunk_shape: [4],
+        data_type: 'int32',
+      })
+      await zarr.set(arr2, null, {
+        data: new Int32Array([10, 20, 30, 40]),
+        shape: [4],
+        stride: [1],
+      })
+
+      const cache = new Map()
+
+      await getWorker(arr1, null, { pool, cache })
+      await getWorker(arr2, null, { pool, cache })
+
+      const keys = Array.from(cache.keys()) as string[]
+
+      pool.terminateWorkers()
+
+      // Extract store ID prefixes
+      const storePrefixes = new Set(keys.map(k => k.split(':')[0]))
+
+      return {
+        cacheSize: cache.size,
+        numStorePrefixes: storePrefixes.size,
+        keys,
+      }
+    })
+
+    expect(result.cacheSize).toBe(2)
+    // Two different stores should have different store_N prefixes
+    expect(result.numStorePrefixes).toBe(2)
+  })
+
+  test('getWorker with cache + useSharedArrayBuffer returns correct SAB-backed data', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [4, 4],
+        chunk_shape: [2, 2],
+        data_type: 'int32',
+      })
+
+      const data = new Int32Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+      await zarr.set(arr, null, { data, shape: [4, 4], stride: [4, 1] })
+
+      const cache = new Map()
+
+      // First call with SAB + cache — cache miss, should decode and cache
+      const chunk1 = await getWorker(arr, null, { pool, cache, useSharedArrayBuffer: true })
+      const cacheSize = cache.size
+
+      // Verify the output is backed by SharedArrayBuffer
+      const isShared1 = (chunk1.data as Int32Array).buffer instanceof SharedArrayBuffer
+
+      // Second call with SAB + cache — cache hit, should skip worker
+      const chunk2 = await getWorker(arr, null, { pool, cache, useSharedArrayBuffer: true })
+      const isShared2 = (chunk2.data as Int32Array).buffer instanceof SharedArrayBuffer
+
+      pool.terminateWorkers()
+
+      return {
+        data1: Array.from(chunk1.data as Int32Array),
+        data2: Array.from(chunk2.data as Int32Array),
+        shape1: chunk1.shape,
+        shape2: chunk2.shape,
+        cacheSize,
+        isShared1,
+        isShared2,
+      }
+    })
+
+    expect(result.data1).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+    expect(result.data2).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+    expect(result.shape1).toEqual([4, 4])
+    expect(result.shape2).toEqual([4, 4])
+    expect(result.cacheSize).toBe(4)
+    expect(result.isShared1).toBe(true)
+    expect(result.isShared2).toBe(true)
+  })
+
+  test('getWorker with cache and gzip-compressed chunks', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [4],
+        chunk_shape: [4],
+        data_type: 'int32',
+        codecs: [
+          { name: 'bytes', configuration: { endian: 'little' } },
+          { name: 'gzip', configuration: { level: 1 } },
+        ],
+      })
+
+      // Manually gzip-compress and write raw chunk bytes
+      const data = new Int32Array([100, 200, 300, 400])
+      const rawBytes = new Uint8Array(data.buffer)
+      const compressedStream = new Response(rawBytes).body!
+        .pipeThrough(new CompressionStream('gzip'))
+      const compressedBytes = new Uint8Array(
+        await new Response(compressedStream).arrayBuffer()
+      )
+      const mapStore = arr.store as unknown as { set(k: string, v: Uint8Array): void }
+      mapStore.set('/c/0', compressedBytes)
+
+      const cache = new Map()
+
+      // First call — decompresses, populates cache
+      const chunk1 = await getWorker(arr, null, { pool, cache })
+
+      // Second call — should use cache, skip decompression
+      const chunk2 = await getWorker(arr, null, { pool, cache })
+
+      pool.terminateWorkers()
+
+      return {
+        data1: Array.from(chunk1.data as Int32Array),
+        data2: Array.from(chunk2.data as Int32Array),
+        cacheSize: cache.size,
+      }
+    })
+
+    expect(result.data1).toEqual([100, 200, 300, 400])
+    expect(result.data2).toEqual([100, 200, 300, 400])
+    expect(result.cacheSize).toBe(1)
+  })
+
+  test('cache with fill-value chunks (missing data)', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [4],
+        chunk_shape: [2],
+        data_type: 'int32',
+        fill_value: 42,
+      })
+
+      // Write data for only the first chunk, leave second as missing
+      await zarr.set(arr, [zarr.slice(0, 2)], {
+        data: new Int32Array([10, 20]),
+        shape: [2],
+        stride: [1],
+      })
+
+      const cache = new Map()
+
+      const chunk1 = await getWorker(arr, null, { pool, cache })
+      const cacheSize = cache.size
+
+      // Second call should use cache
+      const chunk2 = await getWorker(arr, null, { pool, cache })
+
+      pool.terminateWorkers()
+
+      return {
+        data1: Array.from(chunk1.data as Int32Array),
+        data2: Array.from(chunk2.data as Int32Array),
+        cacheSize,
+        cacheSizeAfterSecond: cache.size,
+      }
+    })
+
+    // First chunk has written data, second chunk should have fill value 42
+    expect(result.data1).toEqual([10, 20, 42, 42])
+    expect(result.data2).toEqual([10, 20, 42, 42])
+    expect(result.cacheSize).toBe(2)
+    expect(result.cacheSizeAfterSecond).toBe(2)
+  })
+
 })

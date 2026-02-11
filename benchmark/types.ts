@@ -58,6 +58,12 @@ export interface BenchmarkConfig {
    * for the output buffer, enabling the decode-into-shared optimization.
    */
   useSharedArrayBuffer: boolean
+  /**
+   * When true, include a "Worker + Cache" variant that uses a pre-populated
+   * chunk cache. Warmup iterations populate the cache, then benchmark
+   * iterations measure fully-cached reads that skip decompression.
+   */
+  useChunkCache: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -75,7 +81,7 @@ export interface TimingStats {
 
 export interface OperationResult {
   operation: BenchmarkOperation
-  variant: 'vanilla' | 'worker' | 'worker-sab'
+  variant: 'vanilla' | 'worker' | 'worker-sab' | 'worker-cache'
   stats: TimingStats
 }
 
@@ -92,7 +98,7 @@ export interface BenchmarkResult {
 export interface BenchmarkProgress {
   phase: 'warmup' | 'benchmark'
   operation: BenchmarkOperation
-  variant: 'vanilla' | 'worker' | 'worker-sab'
+  variant: 'vanilla' | 'worker' | 'worker-sab' | 'worker-cache'
   iteration: number
   totalIterations: number
   /** Overall progress 0..1 */

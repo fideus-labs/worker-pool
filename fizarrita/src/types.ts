@@ -6,7 +6,7 @@
  */
 
 import type { WorkerPool } from '@fideus-labs/worker-pool'
-import type { CodecMetadata, DataType, Readable } from 'zarrita'
+import type { Chunk, CodecMetadata, DataType, Readable } from 'zarrita'
 
 // ---------------------------------------------------------------------------
 // Codec chunk metadata — sent to the worker to reconstruct the codec pipeline
@@ -121,6 +121,34 @@ export type WorkerRequest = InitRequest | DecodeRequest | EncodeRequest | Decode
 export type WorkerResponse = InitResponse | DecodeResponse | EncodeResponse | DecodeIntoResponse
 
 // ---------------------------------------------------------------------------
+// Chunk cache — optional decoded-chunk cache for getWorker
+// ---------------------------------------------------------------------------
+
+/**
+ * Interface for a decoded-chunk cache, compatible with `Map`.
+ *
+ * Caches decoded chunks keyed by a string combining the store instance,
+ * array path, and chunk coordinates. This avoids redundant decompression
+ * when accessing overlapping selections or making repeated calls to the
+ * same data.
+ *
+ * @example
+ * ```ts
+ * // Use a plain Map
+ * const cache = new Map()
+ * await getWorker(arr, null, { pool, cache })
+ *
+ * // Use a custom LRU cache
+ * const cache = new LRUCache({ max: 100 })
+ * await getWorker(arr, null, { pool, cache })
+ * ```
+ */
+export interface ChunkCache {
+  get(key: string): Chunk<DataType> | undefined
+  set(key: string, value: Chunk<DataType>): void
+}
+
+// ---------------------------------------------------------------------------
 // Options for getWorker / setWorker
 // ---------------------------------------------------------------------------
 
@@ -146,6 +174,18 @@ export interface GetWorkerOptions<StoreOpts = unknown> {
    * headers to be set. Throws if SharedArrayBuffer is not available.
    */
   useSharedArrayBuffer?: boolean
+  /**
+   * Optional decoded-chunk cache. When provided, `getWorker` checks this
+   * cache before fetching and decoding each chunk. On a cache miss the
+   * decoded chunk is stored for future use, avoiding redundant decompression
+   * on subsequent calls to the same data.
+   *
+   * Any object with `get(key)` and `set(key, value)` works — a plain `Map`
+   * is the simplest option. For bounded memory use an LRU cache.
+   *
+   * Cache keys use the format `store_N:/array/path:c/0/1/2`.
+   */
+  cache?: ChunkCache
 }
 
 export interface SetWorkerOptions {

@@ -67,7 +67,10 @@ export function updateProgress(p: BenchmarkProgress): void {
 
   const phaseLabel = p.phase === 'warmup' ? 'Warmup' : 'Benchmark'
   const opLabel = p.operation === 'read' ? 'Read' : 'Write'
-  const variantLabel = p.variant === 'vanilla' ? 'Vanilla' : p.variant === 'worker-sab' ? 'Worker+SAB' : 'Worker'
+  const variantLabel = p.variant === 'vanilla' ? 'Vanilla'
+    : p.variant === 'worker-sab' ? 'Worker+SAB'
+    : p.variant === 'worker-cache' ? 'Worker+Cache'
+    : 'Worker'
   label.textContent =
     `${phaseLabel} | ${opLabel} (${variantLabel}) | ` +
     `${p.iteration}/${p.totalIterations} | ${(p.progress * 100).toFixed(0)}%`
@@ -109,26 +112,17 @@ function renderSummaryTable(result: BenchmarkResult): void {
   tbody.innerHTML = ''
 
   const hasSab = result.results.some((r) => r.variant === 'worker-sab')
+  const hasCache = result.results.some((r) => r.variant === 'worker-cache')
 
-  // Update table header based on whether SAB column is needed
+  // Build dynamic table header
   const thead = $('results-head')
-  if (hasSab) {
-    thead.innerHTML = `<tr>
-      <th>Operation</th>
-      <th>Vanilla (ms)</th>
-      <th>Worker (ms)</th>
-      <th>Worker+SAB (ms)</th>
-      <th>Speedup (W)</th>
-      <th>Speedup (SAB)</th>
-    </tr>`
-  } else {
-    thead.innerHTML = `<tr>
-      <th>Operation</th>
-      <th>Vanilla (ms)</th>
-      <th>Worker (ms)</th>
-      <th>Speedup</th>
-    </tr>`
-  }
+  let headerCols = '<th>Operation</th><th>Vanilla (ms)</th><th>Worker (ms)</th>'
+  if (hasSab) headerCols += '<th>Worker+SAB (ms)</th>'
+  if (hasCache) headerCols += '<th>Worker+Cache (ms)</th>'
+  headerCols += '<th>Speedup (W)</th>'
+  if (hasSab) headerCols += '<th>Speedup (SAB)</th>'
+  if (hasCache) headerCols += '<th>Speedup (Cache)</th>'
+  thead.innerHTML = `<tr>${headerCols}</tr>`
 
   // Group results by operation
   const ops = new Set(result.results.map((r) => r.operation))
@@ -143,32 +137,47 @@ function renderSummaryTable(result: BenchmarkResult): void {
     const sab = result.results.find(
       (r) => r.operation === op && r.variant === 'worker-sab',
     )
+    const cached = result.results.find(
+      (r) => r.operation === op && r.variant === 'worker-cache',
+    )
 
     if (!vanilla || !worker) continue
 
     const speedup = vanilla.stats.median / worker.stats.median
     const speedupClass = fmtSpeedupClass(speedup)
 
-    const row = document.createElement('tr')
-    if (hasSab && sab) {
-      const sabSpeedup = vanilla.stats.median / sab.stats.median
-      const sabClass = fmtSpeedupClass(sabSpeedup)
-      row.innerHTML = `
-        <td>${op === 'read' ? 'Read (get)' : 'Write (set)'}</td>
-        <td>${fmtMs(vanilla.stats.median)} <span style="color:var(--text-dim)">&plusmn;${fmtMs(vanilla.stats.stddev)}</span></td>
-        <td>${fmtMs(worker.stats.median)} <span style="color:var(--text-dim)">&plusmn;${fmtMs(worker.stats.stddev)}</span></td>
-        <td>${fmtMs(sab.stats.median)} <span style="color:var(--text-dim)">&plusmn;${fmtMs(sab.stats.stddev)}</span></td>
-        <td><span class="${speedupClass}">${speedup.toFixed(2)}x</span></td>
-        <td><span class="${sabClass}">${sabSpeedup.toFixed(2)}x</span></td>
-      `
-    } else {
-      row.innerHTML = `
-        <td>${op === 'read' ? 'Read (get)' : 'Write (set)'}</td>
-        <td>${fmtMs(vanilla.stats.median)} <span style="color:var(--text-dim)">&plusmn;${fmtMs(vanilla.stats.stddev)}</span></td>
-        <td>${fmtMs(worker.stats.median)} <span style="color:var(--text-dim)">&plusmn;${fmtMs(worker.stats.stddev)}</span></td>
-        <td><span class="${speedupClass}">${speedup.toFixed(2)}x</span></td>
-      `
+    const fmtStat = (r: OperationResult) =>
+      `${fmtMs(r.stats.median)} <span style="color:var(--text-dim)">&plusmn;${fmtMs(r.stats.stddev)}</span>`
+
+    let cells = `
+      <td>${op === 'read' ? 'Read (get)' : 'Write (set)'}</td>
+      <td>${fmtStat(vanilla)}</td>
+      <td>${fmtStat(worker)}</td>
+    `
+    if (hasSab) cells += `<td>${sab ? fmtStat(sab) : '—'}</td>`
+    if (hasCache) cells += `<td>${cached ? fmtStat(cached) : '—'}</td>`
+
+    cells += `<td><span class="${speedupClass}">${speedup.toFixed(2)}x</span></td>`
+
+    if (hasSab) {
+      if (sab) {
+        const sabSpeedup = vanilla.stats.median / sab.stats.median
+        cells += `<td><span class="${fmtSpeedupClass(sabSpeedup)}">${sabSpeedup.toFixed(2)}x</span></td>`
+      } else {
+        cells += '<td>—</td>'
+      }
     }
+    if (hasCache) {
+      if (cached) {
+        const cacheSpeedup = vanilla.stats.median / cached.stats.median
+        cells += `<td><span class="${fmtSpeedupClass(cacheSpeedup)}">${cacheSpeedup.toFixed(2)}x</span></td>`
+      } else {
+        cells += '<td>—</td>'
+      }
+    }
+
+    const row = document.createElement('tr')
+    row.innerHTML = cells
     tbody.appendChild(row)
   }
 
@@ -257,6 +266,24 @@ function renderMainChart(result: BenchmarkResult): void {
     })
   }
 
+  const hasCache = result.results.some((r) => r.variant === 'worker-cache')
+  if (hasCache) {
+    const cacheData = ops.map((op) => {
+      const r = result.results.find(
+        (r) => r.operation === op && r.variant === 'worker-cache',
+      )
+      return r?.stats.median ?? 0
+    })
+    datasets.push({
+      label: 'Worker + Cache',
+      data: cacheData,
+      backgroundColor: 'rgba(134, 239, 172, 0.7)',
+      borderColor: 'rgba(134, 239, 172, 1)',
+      borderWidth: 1,
+      borderRadius: 4,
+    })
+  }
+
   const config: ChartConfiguration<'bar'> = {
     type: 'bar',
     data: { labels, datasets },
@@ -311,6 +338,9 @@ function renderDetailCharts(result: BenchmarkResult): void {
     const sab = result.results.find(
       (r) => r.operation === op && r.variant === 'worker-sab',
     )
+    const cached = result.results.find(
+      (r) => r.operation === op && r.variant === 'worker-cache',
+    )
     if (!vanilla || !worker) continue
 
     // Wrapper
@@ -327,7 +357,7 @@ function renderDetailCharts(result: BenchmarkResult): void {
     // Stats grid
     const statsGrid = document.createElement('div')
     statsGrid.className = 'stats-grid'
-    statsGrid.innerHTML = buildStatsGrid(vanilla, worker, sab)
+    statsGrid.innerHTML = buildStatsGrid(vanilla, worker, sab, cached)
     wrapper.appendChild(statsGrid)
 
     container.appendChild(wrapper)
@@ -360,6 +390,17 @@ function renderDetailCharts(result: BenchmarkResult): void {
         data: sab.stats.raw,
         backgroundColor: 'rgba(249, 232, 162, 0.5)',
         borderColor: 'rgba(249, 232, 162, 1)',
+        borderWidth: 1,
+        borderRadius: 3,
+      })
+    }
+
+    if (cached) {
+      datasets.push({
+        label: 'Worker + Cache',
+        data: cached.stats.raw,
+        backgroundColor: 'rgba(134, 239, 172, 0.5)',
+        borderColor: 'rgba(134, 239, 172, 1)',
         borderWidth: 1,
         borderRadius: 3,
       })
@@ -403,6 +444,7 @@ function buildStatsGrid(
   vanilla: OperationResult,
   worker: OperationResult,
   sab?: OperationResult,
+  cached?: OperationResult,
 ): string {
   const pairs: [string, (s: TimingStats) => string][] = [
     ['Mean', (s) => fmtMs(s.mean)],
@@ -420,6 +462,7 @@ function buildStatsGrid(
         <div class="stat-value" style="color:#808080">${fmt(vanilla.stats)}</div>
         <div class="stat-value" style="color:#3562a0">${fmt(worker.stats)}</div>
         ${sab ? `<div class="stat-value" style="color:#f9e8a2">${fmt(sab.stats)}</div>` : ''}
+        ${cached ? `<div class="stat-value" style="color:#86efac">${fmt(cached.stats)}</div>` : ''}
       </div>
     `
   }

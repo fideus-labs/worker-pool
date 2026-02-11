@@ -28,7 +28,7 @@ import {
   assertSharedArrayBufferAvailable,
   createBuffer,
 } from './internals/util.js'
-import type { GetWorkerOptions, CodecChunkMeta } from './types.js'
+import type { GetWorkerOptions, CodecChunkMeta, ChunkCache } from './types.js'
 import { workerDecode, workerDecodeInto, getMetaId } from './worker-rpc.js'
 
 /**
@@ -39,6 +39,37 @@ const DEFAULT_WORKER_URL = new URL('./codec-worker.js', import.meta.url)
 
 /** Shared TextDecoder instance. */
 const decoder = new TextDecoder()
+
+// ---------------------------------------------------------------------------
+// Chunk cache helpers — store-scoped key generation
+// ---------------------------------------------------------------------------
+
+/** No-op cache used when the caller doesn't provide one. */
+const NULL_CACHE: ChunkCache = {
+  get: () => undefined,
+  set: () => {},
+}
+
+/** WeakMap to assign unique IDs to store instances, preventing cache collisions. */
+const storeIdMap = new WeakMap<object, number>()
+let storeIdCounter = 0
+
+function getStoreId(store: Readable): string {
+  if (!storeIdMap.has(store)) {
+    storeIdMap.set(store, storeIdCounter++)
+  }
+  return `store_${storeIdMap.get(store)}`
+}
+
+function createCacheKey<D extends DataType, Store extends Readable>(
+  arr: ZarrArray<D, Store>,
+  encodeChunkKey: (chunk_coords: number[]) => string,
+  chunk_coords: number[],
+): string {
+  const chunkKey = encodeChunkKey(chunk_coords)
+  const storeId = getStoreId(arr.store)
+  return `${storeId}:${arr.path}:${chunkKey}`
+}
 
 // ---------------------------------------------------------------------------
 // Unified metadata reader — reads zarr.json once, returns everything needed
@@ -603,6 +634,7 @@ export async function getWorker<
   const { pool, workerUrl } = opts
   const resolvedWorkerUrl = workerUrl ?? DEFAULT_WORKER_URL
   const useShared = !!opts.useSharedArrayBuffer
+  const cache = opts.cache ?? NULL_CACHE
 
   if (useShared) {
     assertSharedArrayBufferAvailable()
@@ -655,6 +687,17 @@ export async function getWorker<
     )
     const isEdgeChunk = edgeChunkShape.some((s, i) => s !== chunkShape[i])
 
+    // Check cache before building the task — cache hits skip the worker entirely
+    const cacheKey = createCacheKey(arr, encodeChunkKey, chunk_coords)
+    const cachedChunk = cache.get(cacheKey)
+
+    if (cachedChunk) {
+      // Cache hit — copy cached decoded chunk into output on main thread.
+      // No worker needed, no fetch, no decompression.
+      setter.set_from_chunk(out, cachedChunk as Chunk<D>, mapping)
+      continue
+    }
+
     tasks.push(async (workerSlot: Worker | null) => {
       const worker = workerSlot ?? new Worker(resolvedWorkerUrl, { type: 'module' })
 
@@ -676,11 +719,13 @@ export async function getWorker<
           shape: fillChunkShape,
           stride: fillChunkStrides,
         }
+        // Cache the fill-value chunk
+        cache.set(cacheKey, chunk)
         // Copy fill-value chunk into output on main thread
         setter.set_from_chunk(out, chunk, mapping)
-      } else if (useShared) {
-        // Decode-into-shared: worker decodes AND writes directly into
-        // the SharedArrayBuffer output — no transfer back, no main-thread copy
+      } else if (useShared && !opts.cache) {
+        // SAB path (no cache): worker decodes AND writes directly into the
+        // SharedArrayBuffer output — no transfer back, no main-thread copy.
         try {
           await workerDecodeInto(
             worker,
@@ -698,6 +743,20 @@ export async function getWorker<
           worker.terminate()
           throw error
         }
+      } else if (useShared && opts.cache) {
+        // SAB path with cache: use workerDecode to get a standalone chunk
+        // so we can cache it, then copy into the SAB output. The small
+        // overhead of transfer + copy on first access is repaid by
+        // subsequent cache hits that skip the worker entirely.
+        let chunk: Chunk<D>
+        try {
+          chunk = await workerDecode<D>(worker, rawBytes, metaId, correctedCodecMeta, isEdgeChunk ? edgeChunkShape : undefined)
+        } catch (error) {
+          worker.terminate()
+          throw error
+        }
+        cache.set(cacheKey, chunk)
+        setter.set_from_chunk(out, chunk, mapping)
       } else {
         // Standard path: worker decodes, transfers back, main thread copies
         let chunk: Chunk<D>
@@ -707,6 +766,7 @@ export async function getWorker<
           worker.terminate()
           throw error
         }
+        cache.set(cacheKey, chunk)
         setter.set_from_chunk(out, chunk, mapping)
       }
 

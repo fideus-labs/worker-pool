@@ -116,6 +116,7 @@ function readConfig(): BenchmarkConfig {
   if ($<HTMLInputElement>('op-write').checked) operations.push('write')
 
   const useSharedArrayBuffer = $<HTMLInputElement>('opt-sab').checked
+  const useChunkCache = $<HTMLInputElement>('opt-cache').checked
 
   return {
     dataset,
@@ -124,6 +125,7 @@ function readConfig(): BenchmarkConfig {
     warmupRuns,
     operations,
     useSharedArrayBuffer,
+    useChunkCache,
   }
 }
 
