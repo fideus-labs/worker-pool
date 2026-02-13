@@ -30,7 +30,7 @@ Every task function receives an available `Worker` (or `null` when the pool
 needs a new worker created) and **must** return an object with the worker to
 recycle and the result:
 
-```ts
+```typescript
 type WorkerPoolTask<T> = (
   worker: Worker | null
 ) => Promise<{ worker: Worker; result: T }>
@@ -38,7 +38,7 @@ type WorkerPoolTask<T> = (
 
 ### ChunkQueue interface (`add` / `onIdle`)
 
-```ts
+```typescript
 import { WorkerPool } from '@fideus-labs/worker-pool'
 
 const workerUrl = new URL('./my-worker.js', import.meta.url).href
@@ -70,7 +70,7 @@ pool.terminateWorkers()
 Submit an array of tasks at once with optional progress reporting and
 cancellation:
 
-```ts
+```typescript
 const pool = new WorkerPool(2)
 
 const tasks = inputs.map((input) => createTask(input))
@@ -134,7 +134,7 @@ pnpm add @fideus-labs/fizarrita @fideus-labs/worker-pool zarrita
 
 ### Basic usage
 
-```ts
+```typescript
 import { WorkerPool } from '@fideus-labs/worker-pool'
 import { getWorker, setWorker } from '@fideus-labs/fizarrita'
 import * as zarr from 'zarrita'
@@ -159,7 +159,7 @@ pool.terminateWorkers()
 Both `getWorker` and `setWorker` support a `useSharedArrayBuffer` option for
 additional performance:
 
-```ts
+```typescript
 // Read — output allocated on SharedArrayBuffer, workers decode directly
 // into shared memory (eliminates one transfer + one copy per chunk)
 const chunk = await getWorker(arr, null, {
@@ -205,7 +205,7 @@ descriptive error message.
 
 **Vite example:**
 
-```ts
+```typescript
 // vite.config.ts
 export default defineConfig({
   server: {
