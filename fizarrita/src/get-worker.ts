@@ -35,7 +35,7 @@ import { workerDecode, workerDecodeInto, getMetaId } from './worker-rpc.js'
  * Default URL for the codec worker. Uses `import.meta.url` to resolve
  * relative to this module.
  */
-const DEFAULT_WORKER_URL = new URL('./codec-worker.js', import.meta.url)
+export const DEFAULT_WORKER_URL = new URL('./codec-worker.js', import.meta.url)
 
 /** Shared TextDecoder instance. */
 const decoder = new TextDecoder()
@@ -54,14 +54,14 @@ const NULL_CACHE: ChunkCache = {
 const storeIdMap = new WeakMap<object, number>()
 let storeIdCounter = 0
 
-function getStoreId(store: Readable): string {
+export function getStoreId(store: Readable): string {
   if (!storeIdMap.has(store)) {
     storeIdMap.set(store, storeIdCounter++)
   }
   return `store_${storeIdMap.get(store)}`
 }
 
-function createCacheKey<D extends DataType, Store extends Readable>(
+export function createCacheKey<D extends DataType, Store extends Readable>(
   arr: ZarrArray<D, Store>,
   encodeChunkKey: (chunk_coords: number[]) => string,
   chunk_coords: number[],
@@ -75,13 +75,13 @@ function createCacheKey<D extends DataType, Store extends Readable>(
 // Unified metadata reader — reads zarr.json once, returns everything needed
 // ---------------------------------------------------------------------------
 
-interface ArrayMetadata {
+export interface ArrayMetadata {
   codecMeta: CodecChunkMeta
   encodeChunkKey: (chunk_coords: number[]) => string
   fillValue: Scalar<DataType> | null
 }
 
-async function readArrayMetadata<D extends DataType, Store extends Readable>(
+export async function readArrayMetadata<D extends DataType, Store extends Readable>(
   arr: ZarrArray<D, Store>,
 ): Promise<ArrayMetadata> {
   const store = arr.store
@@ -526,7 +526,7 @@ async function validateCandidateChunkShape<D extends DataType, Store extends Rea
  * Returns the corrected chunk shape, or the metadata chunk shape if no
  * correction is needed or possible.
  */
-async function probeActualChunkShape<D extends DataType, Store extends Readable>(
+export async function probeActualChunkShape<D extends DataType, Store extends Readable>(
   arr: ZarrArray<D, Store>,
   encodeChunkKey: (chunk_coords: number[]) => string,
   codecMeta: CodecChunkMeta,
