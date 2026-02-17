@@ -9,33 +9,55 @@
  * Uses WorkerPool.runTasks() for bounded-concurrency scheduling.
  */
 
-import type { WorkerPool, WorkerPoolTask } from '@fideus-labs/worker-pool'
+import type { WorkerPool, WorkerPoolTask } from "@fideus-labs/worker-pool"
 import type {
-  Array as ZarrArray,
   Chunk,
   DataType,
   Readable,
   Scalar,
   Slice,
-} from 'zarrita'
-import { BasicIndexer } from './internals/indexer.js'
-import { create_codec_pipeline } from './internals/codec-pipeline.js'
-import { setter } from './internals/setter.js'
+  Array as ZarrArray,
+} from "zarrita"
+
+import { create_codec_pipeline } from "./internals/codec-pipeline.js"
+import { BasicIndexer } from "./internals/indexer.js"
+import { setter } from "./internals/setter.js"
 import {
+  assertSharedArrayBufferAvailable,
+  create_chunk_key_encoder,
+  createBuffer,
   get_ctr,
   get_strides,
-  create_chunk_key_encoder,
-  assertSharedArrayBufferAvailable,
-  createBuffer,
-} from './internals/util.js'
-import type { GetWorkerOptions, CodecChunkMeta, ChunkCache } from './types.js'
-import { workerDecode, workerDecodeInto, getMetaId } from './worker-rpc.js'
+} from "./internals/util.js"
+import type { ChunkCache, CodecChunkMeta, GetWorkerOptions } from "./types.js"
+import { getMetaId, workerDecode, workerDecodeInto } from "./worker-rpc.js"
 
 /**
  * Default URL for the codec worker. Uses `import.meta.url` to resolve
  * relative to this module.
+ *
+ * @deprecated Use {@link createDefaultWorker} instead — it produces a
+ *   `new Worker(new URL(..., import.meta.url))` expression that bundlers
+ *   like Vite recognise as a worker entry point and bundle accordingly.
  */
-export const DEFAULT_WORKER_URL = new URL('./codec-worker.js', import.meta.url)
+export const DEFAULT_WORKER_URL = new URL("./codec-worker.js", import.meta.url)
+
+/**
+ * Create a Worker using the default codec-worker script bundled with this
+ * package.
+ *
+ * Using `new Worker(new URL(..., import.meta.url))` in a single expression
+ * allows bundlers (Vite, Rollup, webpack 5) to detect the worker entry point
+ * and bundle its dependency graph into a self-contained asset. The previous
+ * approach — storing the URL in a variable and passing it to `new Worker()`
+ * separately — caused bundlers to treat the worker file as a plain static
+ * asset, leaving its relative `./internals/*` imports unresolved.
+ */
+export function createDefaultWorker(): Worker {
+  return new Worker(new URL("./codec-worker.js", import.meta.url), {
+    type: "module",
+  })
+}
 
 /** Shared TextDecoder instance. */
 const decoder = new TextDecoder()
@@ -81,13 +103,16 @@ export interface ArrayMetadata {
   fillValue: Scalar<DataType> | null
 }
 
-export async function readArrayMetadata<D extends DataType, Store extends Readable>(
-  arr: ZarrArray<D, Store>,
-): Promise<ArrayMetadata> {
+export async function readArrayMetadata<
+  D extends DataType,
+  Store extends Readable,
+>(arr: ZarrArray<D, Store>): Promise<ArrayMetadata> {
   const store = arr.store
 
   // Try v3 first: read zarr.json
-  const v3Path = (arr.path === '/' ? '/zarr.json' : `${arr.path}/zarr.json`) as `/${string}`
+  const v3Path = (
+    arr.path === "/" ? "/zarr.json" : `${arr.path}/zarr.json`
+  ) as `/${string}`
   const v3Bytes = await store.get(v3Path)
   if (v3Bytes) {
     const metadata = JSON.parse(decoder.decode(v3Bytes))
@@ -103,13 +128,18 @@ export async function readArrayMetadata<D extends DataType, Store extends Readab
   }
 
   // Try v2: read .zarray
-  const v2Path = (arr.path === '/' ? '/.zarray' : `${arr.path}/.zarray`) as `/${string}`
+  const v2Path = (
+    arr.path === "/" ? "/.zarray" : `${arr.path}/.zarray`
+  ) as `/${string}`
   const v2Bytes = await store.get(v2Path)
   if (v2Bytes) {
     const metadata = JSON.parse(decoder.decode(v2Bytes))
-    const codecs: Array<{ name: string; configuration: Record<string, unknown> }> = []
-    if (metadata.order === 'F') {
-      codecs.push({ name: 'transpose', configuration: { order: 'F' } })
+    const codecs: Array<{
+      name: string
+      configuration: Record<string, unknown>
+    }> = []
+    if (metadata.order === "F") {
+      codecs.push({ name: "transpose", configuration: { order: "F" } })
     }
     if (metadata.compressor) {
       const { id, ...configuration } = metadata.compressor
@@ -122,11 +152,14 @@ export async function readArrayMetadata<D extends DataType, Store extends Readab
       codecMeta: {
         data_type: arr.dtype,
         chunk_shape: arr.chunks,
-        codecs: codecs.length > 0 ? codecs : [{ name: 'bytes', configuration: { endian: 'little' } }],
+        codecs:
+          codecs.length > 0
+            ? codecs
+            : [{ name: "bytes", configuration: { endian: "little" } }],
       },
       encodeChunkKey: create_chunk_key_encoder({
-        name: 'v2',
-        configuration: { separator: metadata.dimension_separator ?? '.' },
+        name: "v2",
+        configuration: { separator: metadata.dimension_separator ?? "." },
       }),
       fillValue: metadata.fill_value ?? null,
     }
@@ -137,9 +170,9 @@ export async function readArrayMetadata<D extends DataType, Store extends Readab
     codecMeta: {
       data_type: arr.dtype,
       chunk_shape: arr.chunks,
-      codecs: [{ name: 'bytes', configuration: { endian: 'little' } }],
+      codecs: [{ name: "bytes", configuration: { endian: "little" } }],
     },
-    encodeChunkKey: create_chunk_key_encoder({ name: 'default' }),
+    encodeChunkKey: create_chunk_key_encoder({ name: "default" }),
     fillValue: null,
   }
 }
@@ -156,7 +189,9 @@ export async function readArrayMetadata<D extends DataType, Store extends Readab
  * Zstd frame format:
  *   [4 bytes magic 0xFD2FB528] [1 byte FHD] [0-1 byte window] [0-4 dict] [0-8 FCS]
  */
-export function readZstdFrameContentSize(compressed: Uint8Array): number | null {
+export function readZstdFrameContentSize(
+  compressed: Uint8Array,
+): number | null {
   if (compressed.length < 6) return null
 
   const magic =
@@ -164,7 +199,7 @@ export function readZstdFrameContentSize(compressed: Uint8Array): number | null 
     (compressed[1] << 8) |
     (compressed[2] << 16) |
     (compressed[3] << 24)
-  if ((magic >>> 0) !== 0xfd2fb528) return null
+  if (magic >>> 0 !== 0xfd2fb528) return null
 
   const fhd = compressed[4]
   const fcsFlag = (fhd >> 6) & 3
@@ -212,7 +247,9 @@ export function readZstdFrameContentSize(compressed: Uint8Array): number | null 
  *
  * The nbytes field at offset 4 is the uncompressed data size in bytes.
  */
-export function readBloscFrameContentSize(compressed: Uint8Array): number | null {
+export function readBloscFrameContentSize(
+  compressed: Uint8Array,
+): number | null {
   if (compressed.length < 16) return null
 
   // Blosc version must be >= 1 (version byte at offset 0)
@@ -284,14 +321,14 @@ async function probeDecompressedSize<D extends DataType>(
     // array_to_bytes codecs (bytes, etc.) don't compress
     // bytes_to_bytes codecs are the compressors
     return (
-      name === 'gzip' ||
-      name === 'zlib' ||
-      name === 'blosc' ||
-      name === 'zstd' ||
-      name === 'lz4' ||
-      name === 'bz2' ||
-      name === 'lzma' ||
-      name === 'snappy'
+      name === "gzip" ||
+      name === "zlib" ||
+      name === "blosc" ||
+      name === "zstd" ||
+      name === "lz4" ||
+      name === "bz2" ||
+      name === "lzma" ||
+      name === "snappy"
     )
   })
   if (!hasCompression) {
@@ -349,7 +386,8 @@ export function inferChunkShape(
   function scoreCandidate(shape: number[]): number {
     // L1 distance from metadata
     let l1 = 0
-    for (let i = 0; i < shape.length; i++) l1 += Math.abs(shape[i] - metadataChunkShape[i])
+    for (let i = 0; i < shape.length; i++)
+      l1 += Math.abs(shape[i] - metadataChunkShape[i])
 
     // Penalty for non-power-of-2 dimensions
     let pow2Penalty = 0
@@ -381,7 +419,7 @@ export function inferChunkShape(
   }
 
   function addCandidate(shape: number[]): void {
-    const key = shape.join(',')
+    const key = shape.join(",")
     if (seen.has(key)) return
     seen.add(key)
     allCandidates.push({ shape, score: scoreCandidate(shape) })
@@ -395,7 +433,11 @@ export function inferChunkShape(
     )
     if (fixedProduct === 0 || actualElements % fixedProduct !== 0) continue
     const candidate = actualElements / fixedProduct
-    if (candidate > 0 && candidate <= arrayShape[vary] && Number.isInteger(candidate)) {
+    if (
+      candidate > 0 &&
+      candidate <= arrayShape[vary] &&
+      Number.isInteger(candidate)
+    ) {
       const result = [...metadataChunkShape]
       result[vary] = candidate
       addCandidate(result)
@@ -463,11 +505,14 @@ export function inferChunkShape(
  * Returns true if the candidate is valid (probe returned 404/empty),
  * false if invalid (probe returned data, meaning chunks are too coarse).
  */
-async function validateCandidateChunkShape<D extends DataType, Store extends Readable>(
+async function validateCandidateChunkShape<
+  D extends DataType,
+  Store extends Readable,
+>(
   arr: ZarrArray<D, Store>,
   encodeChunkKey: (chunk_coords: number[]) => string,
   candidate: number[],
-  storeOpts?: Parameters<Store['get']>[1],
+  storeOpts?: Parameters<Store["get"]>[1],
 ): Promise<boolean> {
   const ndim = candidate.length
 
@@ -526,12 +571,15 @@ async function validateCandidateChunkShape<D extends DataType, Store extends Rea
  * Returns the corrected chunk shape, or the metadata chunk shape if no
  * correction is needed or possible.
  */
-export async function probeActualChunkShape<D extends DataType, Store extends Readable>(
+export async function probeActualChunkShape<
+  D extends DataType,
+  Store extends Readable,
+>(
   arr: ZarrArray<D, Store>,
   encodeChunkKey: (chunk_coords: number[]) => string,
   codecMeta: CodecChunkMeta,
   bytesPerElement: number,
-  storeOpts?: Parameters<Store['get']>[1],
+  storeOpts?: Parameters<Store["get"]>[1],
 ): Promise<number[]> {
   const metadataChunkShape = codecMeta.chunk_shape
   const metaElements = metadataChunkShape.reduce((a, b) => a * b, 1)
@@ -546,14 +594,22 @@ export async function probeActualChunkShape<D extends DataType, Store extends Re
     if (!rawBytes) return metadataChunkShape
 
     // Determine decompressed size via hybrid strategy
-    const decompressedBytes = await probeDecompressedSize(rawBytes, codecMeta, bytesPerElement)
+    const decompressedBytes = await probeDecompressedSize(
+      rawBytes,
+      codecMeta,
+      bytesPerElement,
+    )
     if (decompressedBytes == null) return metadataChunkShape
 
     const actualElements = decompressedBytes / bytesPerElement
     if (actualElements === metaElements) return metadataChunkShape
 
     // Mismatch detected — infer chunk shape from element count + heuristics
-    const candidates = inferChunkShape(actualElements, metadataChunkShape, arr.shape)
+    const candidates = inferChunkShape(
+      actualElements,
+      metadataChunkShape,
+      arr.shape,
+    )
     if (candidates.length === 0) return metadataChunkShape
 
     // Validate candidates by probing one-past-the-end.
@@ -562,7 +618,12 @@ export async function probeActualChunkShape<D extends DataType, Store extends Re
     const maxValidationAttempts = Math.min(candidates.length, 5)
     for (let i = 0; i < maxValidationAttempts; i++) {
       const candidate = candidates[i]
-      const isValid = await validateCandidateChunkShape(arr, encodeChunkKey, candidate, storeOpts)
+      const isValid = await validateCandidateChunkShape(
+        arr,
+        encodeChunkKey,
+        candidate,
+        storeOpts,
+      )
       if (isValid) {
         console.warn(
           `[fizarrita] Metadata chunk_shape ${JSON.stringify(metadataChunkShape)} ` +
@@ -623,7 +684,7 @@ export async function getWorker<
 >(
   arr: ZarrArray<D, Store>,
   selection: Sel | null = null,
-  opts: GetWorkerOptions<Parameters<Store['get']>[1]>,
+  opts: GetWorkerOptions<Parameters<Store["get"]>[1]>,
 ): Promise<
   null extends Sel[number]
     ? Chunk<D>
@@ -632,7 +693,6 @@ export async function getWorker<
       : Scalar<D>
 > {
   const { pool, workerUrl } = opts
-  const resolvedWorkerUrl = workerUrl ?? DEFAULT_WORKER_URL
   const useShared = !!opts.useSharedArrayBuffer
   const cache = opts.cache ?? NULL_CACHE
 
@@ -644,15 +704,23 @@ export async function getWorker<
   const { codecMeta, encodeChunkKey, fillValue } = await readArrayMetadata(arr)
 
   const Ctr = get_ctr(arr.dtype)
-  const bytesPerElement = (Ctr as unknown as { BYTES_PER_ELEMENT: number }).BYTES_PER_ELEMENT
+  const bytesPerElement = (Ctr as unknown as { BYTES_PER_ELEMENT: number })
+    .BYTES_PER_ELEMENT
 
   // Probe actual chunk shape — detects metadata vs data mismatch
-  const actualChunkShape = await probeActualChunkShape(arr, encodeChunkKey, codecMeta, bytesPerElement, opts.opts)
+  const actualChunkShape = await probeActualChunkShape(
+    arr,
+    encodeChunkKey,
+    codecMeta,
+    bytesPerElement,
+    opts.opts,
+  )
 
   // Update codecMeta to use the actual chunk shape for codec pipeline
-  const correctedCodecMeta = actualChunkShape !== codecMeta.chunk_shape
-    ? { ...codecMeta, chunk_shape: actualChunkShape }
-    : codecMeta
+  const correctedCodecMeta =
+    actualChunkShape !== codecMeta.chunk_shape
+      ? { ...codecMeta, chunk_shape: actualChunkShape }
+      : codecMeta
 
   // Get stable metaId for the codec metadata (used by worker-rpc meta-init)
   const metaId = getMetaId(correctedCodecMeta)
@@ -699,7 +767,11 @@ export async function getWorker<
     }
 
     tasks.push(async (workerSlot: Worker | null) => {
-      const worker = workerSlot ?? new Worker(resolvedWorkerUrl, { type: 'module' })
+      const worker =
+        workerSlot ??
+        (workerUrl
+          ? new Worker(workerUrl, { type: "module" })
+          : createDefaultWorker())
 
       // Fetch raw bytes from store on main thread
       const rawBytes = await arr.store.get(chunkPath, opts.opts)
@@ -708,14 +780,17 @@ export async function getWorker<
         // Missing chunk — fill value, no worker needed
         const fillChunkShape = edgeChunkShape
         const fillChunkStrides = get_strides(fillChunkShape)
-        const fillChunkSize = fillChunkShape.reduce((a: number, b: number) => a * b, 1)
+        const fillChunkSize = fillChunkShape.reduce(
+          (a: number, b: number) => a * b,
+          1,
+        )
         const chunkData = new Ctr(fillChunkSize)
         if (fillValue != null) {
           // @ts-expect-error: fill_value type is union
           chunkData.fill(fillValue)
         }
         const chunk: Chunk<D> = {
-          data: chunkData as Chunk<D>['data'],
+          data: chunkData as Chunk<D>["data"],
           shape: fillChunkShape,
           stride: fillChunkStrides,
         }
@@ -750,7 +825,13 @@ export async function getWorker<
         // subsequent cache hits that skip the worker entirely.
         let chunk: Chunk<D>
         try {
-          chunk = await workerDecode<D>(worker, rawBytes, metaId, correctedCodecMeta, isEdgeChunk ? edgeChunkShape : undefined)
+          chunk = await workerDecode<D>(
+            worker,
+            rawBytes,
+            metaId,
+            correctedCodecMeta,
+            isEdgeChunk ? edgeChunkShape : undefined,
+          )
         } catch (error) {
           worker.terminate()
           throw error
@@ -761,7 +842,13 @@ export async function getWorker<
         // Standard path: worker decodes, transfers back, main thread copies
         let chunk: Chunk<D>
         try {
-          chunk = await workerDecode<D>(worker, rawBytes, metaId, correctedCodecMeta, isEdgeChunk ? edgeChunkShape : undefined)
+          chunk = await workerDecode<D>(
+            worker,
+            rawBytes,
+            metaId,
+            correctedCodecMeta,
+            isEdgeChunk ? edgeChunkShape : undefined,
+          )
         } catch (error) {
           worker.terminate()
           throw error
@@ -782,9 +869,10 @@ export async function getWorker<
 
   // If the final shape is empty (all integer selections), return a scalar
   if (indexer.shape.length === 0) {
-    const unwrap = 'get' in out.data
-      ? (out.data as unknown as { get(idx: number): Scalar<D> }).get(0)
-      : (out.data as unknown as ArrayLike<Scalar<D>>)[0]
+    const unwrap =
+      "get" in out.data
+        ? (out.data as unknown as { get(idx: number): Scalar<D> }).get(0)
+        : (out.data as unknown as ArrayLike<Scalar<D>>)[0]
     // @ts-expect-error: TS can't narrow conditional type
     return unwrap
   }
