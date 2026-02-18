@@ -20,11 +20,12 @@
  *                -> { type: 'encoded', id, bytes: ArrayBuffer }
  */
 
-import { create_codec_pipeline } from './internals/codec-pipeline.js'
-import { compat_chunk, set_from_chunk_binary } from './internals/setter.js'
-import { get_ctr, get_strides } from './internals/util.js'
-import type { Chunk, DataType } from 'zarrita'
-import type { CodecChunkMeta, Projection } from './types.js'
+import type { Chunk, DataType } from "zarrita"
+
+import { create_codec_pipeline } from "./internals/codec-pipeline.js"
+import { compat_chunk, set_from_chunk_binary } from "./internals/setter.js"
+import { get_ctr, get_strides } from "./internals/util.js"
+import type { CodecChunkMeta, Projection } from "./types.js"
 
 const ctx = self as unknown as DedicatedWorkerGlobalScope
 
@@ -46,19 +47,70 @@ function fixEdgeChunkShapeStride<D extends DataType>(
   actualChunkShape?: number[],
 ): Chunk<D> {
   if (actualChunkShape) {
-    // Caller told us the actual shape — use it directly
     const expectedElements = actualChunkShape.reduce((a, b) => a * b, 1)
     const actualElements = (chunk.data as unknown as ArrayLike<unknown>).length
     if (actualElements === expectedElements) {
+      // Decoded size matches the actual edge shape — just fix shape/stride
       return {
         data: chunk.data,
         shape: actualChunkShape,
-        stride: get_strides(actualChunkShape, 'C'),
+        stride: get_strides(actualChunkShape, "C"),
+      }
+    }
+    if (actualElements > expectedElements) {
+      // Decoded chunk is padded to full chunk_shape (e.g. by setWorker).
+      // Extract the valid sub-region into a compact contiguous buffer.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const src = chunk.data as any
+      const Ctr = src.constructor as new (n: number) => typeof src
+      const dst = new Ctr(expectedElements)
+      const srcStrides = get_strides(chunk.shape, "C")
+      copySubRegion(src, srcStrides, dst, actualChunkShape)
+      return {
+        data: dst as typeof chunk.data,
+        shape: actualChunkShape,
+        stride: get_strides(actualChunkShape, "C"),
       }
     }
   }
   // No correction needed or no actualChunkShape provided
   return chunk
+}
+
+/**
+ * Copy a sub-region from a padded C-order buffer into a compact destination.
+ *
+ * For each dimension, copies only the first `subShape[d]` elements along
+ * that axis from the source (which has strides `srcStrides`).
+ */
+function copySubRegion(
+  src: { readonly [i: number]: unknown; readonly length: number },
+  srcStrides: number[],
+  dst: { [i: number]: unknown; length: number },
+  subShape: number[],
+  srcOffset = 0,
+  dstOffset = 0,
+  dim = 0,
+): void {
+  if (dim === subShape.length - 1) {
+    // Innermost dimension — copy contiguous run
+    for (let i = 0; i < subShape[dim]; i++) {
+      dst[dstOffset + i] = src[srcOffset + i]
+    }
+    return
+  }
+  const dstStride = subShape.slice(dim + 1).reduce((a, b) => a * b, 1)
+  for (let i = 0; i < subShape[dim]; i++) {
+    copySubRegion(
+      src,
+      srcStrides,
+      dst,
+      subShape,
+      srcOffset + i * srcStrides[dim],
+      dstOffset + i * dstStride,
+      dim + 1,
+    )
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -82,7 +134,9 @@ const pipelineByKey = new Map<
 function getPipeline(metaId: number): ReturnType<typeof create_codec_pipeline> {
   const pipeline = pipelineByMetaId.get(metaId)
   if (!pipeline) {
-    throw new Error(`No pipeline for metaId ${metaId}. Send an 'init' message first.`)
+    throw new Error(
+      `No pipeline for metaId ${metaId}. Send an 'init' message first.`,
+    )
   }
   return pipeline
 }
@@ -106,16 +160,40 @@ function getOrCreatePipelineLegacy(meta: CodecChunkMeta) {
 // ---------------------------------------------------------------------------
 
 type WorkerMessage =
-  | { type: 'init'; id: number; metaId: number; meta: CodecChunkMeta }
-  | { type: 'decode'; id: number; bytes: ArrayBuffer; metaId?: number; meta?: CodecChunkMeta; actualChunkShape?: number[] }
-  | { type: 'decode_into'; id: number; bytes: ArrayBuffer; metaId: number; output: SharedArrayBuffer; outputByteLength: number; outputStride: number[]; projections: Projection[]; bytesPerElement: number; actualChunkShape?: number[] }
-  | { type: 'encode'; id: number; data: ArrayBuffer; metaId?: number; meta?: CodecChunkMeta }
+  | { type: "init"; id: number; metaId: number; meta: CodecChunkMeta }
+  | {
+      type: "decode"
+      id: number
+      bytes: ArrayBuffer
+      metaId?: number
+      meta?: CodecChunkMeta
+      actualChunkShape?: number[]
+    }
+  | {
+      type: "decode_into"
+      id: number
+      bytes: ArrayBuffer
+      metaId: number
+      output: SharedArrayBuffer
+      outputByteLength: number
+      outputStride: number[]
+      projections: Projection[]
+      bytesPerElement: number
+      actualChunkShape?: number[]
+    }
+  | {
+      type: "encode"
+      id: number
+      data: ArrayBuffer
+      metaId?: number
+      meta?: CodecChunkMeta
+    }
 
-ctx.addEventListener('message', async (event: MessageEvent<WorkerMessage>) => {
+ctx.addEventListener("message", async (event: MessageEvent<WorkerMessage>) => {
   const msg = event.data
 
   try {
-    if (msg.type === 'init') {
+    if (msg.type === "init") {
       // Register codec metadata and pre-create pipeline
       metaByMetaId.set(msg.metaId, msg.meta)
       const pipeline = create_codec_pipeline({
@@ -124,18 +202,19 @@ ctx.addEventListener('message', async (event: MessageEvent<WorkerMessage>) => {
         codecs: msg.meta.codecs,
       })
       pipelineByMetaId.set(msg.metaId, pipeline)
-      ctx.postMessage({ type: 'init_ok', id: msg.id })
+      ctx.postMessage({ type: "init_ok", id: msg.id })
       return
     }
 
-    if (msg.type === 'decode') {
+    if (msg.type === "decode") {
       // Resolve pipeline: prefer metaId, fall back to legacy meta
-      const pipeline = msg.metaId !== undefined && pipelineByMetaId.has(msg.metaId)
-        ? getPipeline(msg.metaId)
-        : getOrCreatePipelineLegacy(msg.meta!)
+      const pipeline =
+        msg.metaId !== undefined && pipelineByMetaId.has(msg.metaId)
+          ? getPipeline(msg.metaId)
+          : getOrCreatePipelineLegacy(msg.meta!)
 
       const bytes = new Uint8Array(msg.bytes)
-      let chunk = await pipeline.decode(bytes) as Chunk<DataType>
+      let chunk = (await pipeline.decode(bytes)) as Chunk<DataType>
 
       // Fix shape/stride for edge chunks (smaller than metadata chunk_shape)
       chunk = fixEdgeChunkShapeStride(chunk, msg.actualChunkShape)
@@ -160,7 +239,7 @@ ctx.addEventListener('message', async (event: MessageEvent<WorkerMessage>) => {
 
       ctx.postMessage(
         {
-          type: 'decoded' as const,
+          type: "decoded" as const,
           id: msg.id,
           data: transferBuffer,
           shape: chunk.shape,
@@ -168,11 +247,11 @@ ctx.addEventListener('message', async (event: MessageEvent<WorkerMessage>) => {
         },
         [transferBuffer],
       )
-    } else if (msg.type === 'decode_into') {
+    } else if (msg.type === "decode_into") {
       // Decode and write directly into SharedArrayBuffer — no transfer back
       const pipeline = getPipeline(msg.metaId)
       const bytes = new Uint8Array(msg.bytes)
-      let chunk = await pipeline.decode(bytes) as Chunk<DataType>
+      let chunk = (await pipeline.decode(bytes)) as Chunk<DataType>
 
       // Fix shape/stride for edge chunks (smaller than metadata chunk_shape)
       chunk = fixEdgeChunkShapeStride(chunk, msg.actualChunkShape)
@@ -191,8 +270,8 @@ ctx.addEventListener('message', async (event: MessageEvent<WorkerMessage>) => {
         msg.projections,
       )
 
-      ctx.postMessage({ type: 'decode_into_ok', id: msg.id })
-    } else if (msg.type === 'encode') {
+      ctx.postMessage({ type: "decode_into_ok", id: msg.id })
+    } else if (msg.type === "encode") {
       // Resolve pipeline and meta
       let pipeline: ReturnType<typeof create_codec_pipeline>
       let meta: CodecChunkMeta
@@ -215,20 +294,24 @@ ctx.addEventListener('message', async (event: MessageEvent<WorkerMessage>) => {
         msg.data.byteLength / Ctr.BYTES_PER_ELEMENT,
       )
       const shape = meta.chunk_shape
-      const stride = get_strides(shape, 'C')
+      const stride = get_strides(shape, "C")
 
       const chunk = { data, shape, stride } as Chunk<DataType>
       const encoded = await pipeline.encode(chunk)
 
       // Transfer the encoded bytes back
       const transferBuffer =
-        encoded.byteOffset === 0 && encoded.byteLength === encoded.buffer.byteLength
+        encoded.byteOffset === 0 &&
+        encoded.byteLength === encoded.buffer.byteLength
           ? (encoded.buffer as ArrayBuffer)
-          : encoded.buffer.slice(encoded.byteOffset, encoded.byteOffset + encoded.byteLength)
+          : encoded.buffer.slice(
+              encoded.byteOffset,
+              encoded.byteOffset + encoded.byteLength,
+            )
 
       ctx.postMessage(
         {
-          type: 'encoded' as const,
+          type: "encoded" as const,
           id: msg.id,
           bytes: transferBuffer,
         },
@@ -238,7 +321,14 @@ ctx.addEventListener('message', async (event: MessageEvent<WorkerMessage>) => {
   } catch (error) {
     // Send error back to main thread
     ctx.postMessage({
-      type: msg.type === 'decode' ? 'decoded' : msg.type === 'encode' ? 'encoded' : msg.type === 'decode_into' ? 'decode_into_ok' : 'init_ok',
+      type:
+        msg.type === "decode"
+          ? "decoded"
+          : msg.type === "encode"
+            ? "encoded"
+            : msg.type === "decode_into"
+              ? "decode_into_ok"
+              : "init_ok",
       id: msg.id,
       error: error instanceof Error ? error.message : String(error),
     })
