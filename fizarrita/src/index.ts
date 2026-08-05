@@ -14,6 +14,7 @@ export {
   DEFAULT_WORKER_URL,
   getStoreId,
   getWorker,
+  hasSizeChangingCodec,
   inferChunkShape,
   probeActualChunkShape,
   readArrayMetadata,

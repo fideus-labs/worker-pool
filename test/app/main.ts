@@ -67,7 +67,7 @@ import type {
 // ---------------------------------------------------------------------------
 
 import * as zarr from 'zarrita'
-import { getWorker, setWorker, readZstdFrameContentSize, readBloscFrameContentSize, inferChunkShape } from '../../fizarrita/src/index.js'
+import { getWorker, setWorker, readZstdFrameContentSize, readBloscFrameContentSize, inferChunkShape, hasSizeChangingCodec } from '../../fizarrita/src/index.js'
 import type { GetWorkerOptions, SetWorkerOptions, ChunkCache } from '../../fizarrita/src/index.js'
 
 // Expose helpers on the window so Playwright tests can call them.
@@ -94,6 +94,7 @@ declare global {
     readZstdFrameContentSize: typeof readZstdFrameContentSize
     readBloscFrameContentSize: typeof readBloscFrameContentSize
     inferChunkShape: typeof inferChunkShape
+    hasSizeChangingCodec: typeof hasSizeChangingCodec
   }
 }
 
@@ -120,3 +121,4 @@ window.setWorker = setWorker
 window.readZstdFrameContentSize = readZstdFrameContentSize
 window.readBloscFrameContentSize = readBloscFrameContentSize
 window.inferChunkShape = inferChunkShape
+window.hasSizeChangingCodec = hasSizeChangingCodec

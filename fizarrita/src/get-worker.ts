@@ -12,6 +12,7 @@
 import type { WorkerPool, WorkerPoolTask } from "@fideus-labs/worker-pool"
 import type {
   Chunk,
+  CodecMetadata,
   DataType,
   Readable,
   Scalar,
@@ -287,13 +288,53 @@ export function readBloscFrameContentSize(
 }
 
 /**
+ * Codecs whose encoded output is exactly as long as the array bytes they encode,
+ * so that a raw chunk's `byteLength` IS its decoded byte length.
+ *
+ * The list is short because the property is strict. `transpose` reorders and
+ * `bytes` reinterprets, neither changing the count. Everything else changes it
+ * one way or another: compressors shrink, `crc32c` appends a checksum,
+ * `scale_offset` and `cast_value` re-type the values, `vlen-utf8` and `json2`
+ * are variable-length, and `sharding_indexed` wraps a whole index plus inner
+ * chunks that are usually compressed themselves.
+ *
+ * v2-style `numcodecs.` prefixes are stripped before lookup, so
+ * `numcodecs.transpose` matches.
+ */
+const SIZE_PRESERVING_CODECS = new Set(["bytes", "transpose"])
+
+/**
+ * Whether any codec in the chain makes the raw chunk length differ from the
+ * decoded length.
+ *
+ * Deliberately answered by allowlisting the codecs known to preserve size, not
+ * by listing the compressors: an unrecognised codec must count as size-changing.
+ * The two mistakes are not symmetric — treating a size-changing codec as
+ * size-preserving returns the *compressed* length as the decompressed one, a
+ * silently wrong number that {@link inferChunkShape} then takes as fact, while
+ * treating a size-preserving codec as size-changing only costs one decode via
+ * the fallback and still returns the right answer.
+ *
+ * Naming compressors instead put every codec outside a fixed list —
+ * e.g. HTJ2K — on the silently-wrong side.
+ */
+export function hasSizeChangingCodec(
+  codecs: readonly Pick<CodecMetadata, "name">[],
+): boolean {
+  return codecs.some((codec) => {
+    const name = codec.name.toLowerCase().replace(/^numcodecs\./, "")
+    return !SIZE_PRESERVING_CODECS.has(name)
+  })
+}
+
+/**
  * Try to determine the decompressed byte size of a raw chunk without full decoding.
  *
  * Hybrid strategy (cheapest first):
  *  1. Zstd frame header — read FCS field (zero-cost, no decompression)
  *  2. Blosc header — read nbytes field (zero-cost, no decompression)
- *  3. Uncompressed check — if raw byte count matches a plausible element count,
- *     the chunk may be uncompressed (bytes codec only)
+ *  3. Size-preserving check — if every codec in the chain preserves byte count,
+ *     the raw byte count IS the decompressed size
  *  4. Full decode — decode chunk c/0/0/0 using the codec pipeline and count elements
  *
  * Returns the decompressed byte size, or null if detection failed.
@@ -312,27 +353,9 @@ async function probeDecompressedSize<D extends DataType>(
   if (bloscSize != null) return bloscSize
 
   // 3. Check if the raw bytes could be an uncompressed chunk.
-  //    For the bytes codec (no compression), rawBytes.byteLength IS the
-  //    decompressed size. We check whether the codec chain is bytes-only
-  //    (no bytes_to_bytes compression codecs).
-  const hasCompression = codecMeta.codecs.some((c) => {
-    const name = c.name.toLowerCase()
-    // array_to_array codecs (transpose, etc.) don't change byte size
-    // array_to_bytes codecs (bytes, etc.) don't compress
-    // bytes_to_bytes codecs are the compressors
-    return (
-      name === "gzip" ||
-      name === "zlib" ||
-      name === "blosc" ||
-      name === "zstd" ||
-      name === "lz4" ||
-      name === "bz2" ||
-      name === "lzma" ||
-      name === "snappy"
-    )
-  })
-  if (!hasCompression) {
-    // No compression codec — raw bytes are the decompressed data
+  //    When every codec preserves byte count, rawBytes.byteLength IS the
+  //    decompressed size.
+  if (!hasSizeChangingCodec(codecMeta.codecs)) {
     return rawBytes.byteLength
   }
 

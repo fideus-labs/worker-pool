@@ -744,3 +744,66 @@ test.describe('getWorker — chunk shape auto-detection integration', () => {
     ])
   })
 })
+
+test.describe('hasSizeChangingCodec', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto('/')
+    await page.waitForFunction(() => typeof window.hasSizeChangingCodec === 'function')
+  })
+
+  const classify = (page: import('@playwright/test').Page, names: string[]) =>
+    page.evaluate(
+      (codecNames) => window.hasSizeChangingCodec(codecNames.map((name) => ({ name }))),
+      names,
+    )
+
+  test('treats a bytes-only chain as size-preserving', async ({ page }) => {
+    expect(await classify(page, ['bytes'])).toBe(false)
+  })
+
+  test('treats transpose + bytes as size-preserving', async ({ page }) => {
+    expect(await classify(page, ['transpose', 'bytes'])).toBe(false)
+  })
+
+  test('strips the numcodecs. prefix before matching', async ({ page }) => {
+    expect(await classify(page, ['numcodecs.transpose', 'bytes'])).toBe(false)
+  })
+
+  test('is case-insensitive', async ({ page }) => {
+    expect(await classify(page, ['Bytes', 'TRANSPOSE'])).toBe(false)
+  })
+
+  test('flags the known compressors', async ({ page }) => {
+    for (const name of ['gzip', 'zlib', 'blosc', 'zstd', 'lz4']) {
+      expect(await classify(page, ['bytes', name])).toBe(true)
+    }
+  })
+
+  // The regression this function exists for. A JPEG 2000 chunk is compressed by
+  // an order of magnitude or more, but its codec name is on no fixed list of
+  // compressors — so a compressor-allowlist reported the *compressed* length as
+  // the decompressed one and fed that to inferChunkShape as fact.
+  test('flags codecs it does not recognise, including JPEG 2000 and HTJ2K', async ({ page }) => {
+    for (const name of ['imagecodecs_jpeg2k', 'htj2k', 'jpeg2k', 'imagecodecs_jpegxl']) {
+      expect(await classify(page, ['bytes', name])).toBe(true)
+    }
+  })
+
+  // Not compression, but not size-preserving either: crc32c appends a 4-byte
+  // checksum, and scale_offset/cast_value re-type the values.
+  test('flags codecs that resize without compressing', async ({ page }) => {
+    for (const name of ['crc32c', 'scale_offset', 'cast_value', 'vlen-utf8', 'json2']) {
+      expect(await classify(page, ['bytes', name])).toBe(true)
+    }
+  })
+
+  // Sharding wraps an index plus inner chunks that are usually compressed
+  // themselves, so a shard's raw length is never its decoded length.
+  test('flags sharding', async ({ page }) => {
+    expect(await classify(page, ['sharding_indexed'])).toBe(true)
+  })
+
+  test('treats an empty codec chain as size-preserving', async ({ page }) => {
+    expect(await classify(page, [])).toBe(false)
+  })
+})
