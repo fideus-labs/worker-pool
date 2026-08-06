@@ -352,9 +352,9 @@ async function probeDecompressedSize<D extends DataType>(
   const bloscSize = readBloscFrameContentSize(rawBytes)
   if (bloscSize != null) return bloscSize
 
-  // 3. Check if the raw bytes could be an uncompressed chunk.
-  //    When every codec preserves byte count, rawBytes.byteLength IS the
-  //    decompressed size.
+  // 3. Check whether the codec chain preserves byte count end to end — a
+  //    transpose + bytes chain does, not just a bare bytes one. When it does,
+  //    rawBytes.byteLength IS the decompressed size.
   if (!hasSizeChangingCodec(codecMeta.codecs)) {
     return rawBytes.byteLength
   }
