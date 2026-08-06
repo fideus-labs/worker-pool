@@ -1914,10 +1914,18 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
 
     expect(result.hasGetOps).toBe(true)
     expect(result.hasSetOps).toBe(true)
-    // First call: 2 get misses + 2 set calls = 4 ops
-    expect(result.opsAfterFirst.length).toBe(4)
-    // Second call: 2 get hits (no sets since already cached)
-    expect(result.opsAll.length).toBe(6)
+    // First call, per chunk: one get when the task list is built (miss), a
+    // second get when the task actually runs (still a miss here — nothing else
+    // is in flight), then one set. Two chunks, so 6 ops.
+    //
+    // The second get is what lets a task pick up a chunk that a concurrent
+    // `getWorker` finished in the interval between the list being built and the
+    // task starting — without it, that task refetches and redecodes something
+    // already sitting in the cache.
+    expect(result.opsAfterFirst.length).toBe(6)
+    // Second call: 2 get hits at build time, so no task is created and no
+    // second get or set happens.
+    expect(result.opsAll.length).toBe(8)
   })
 
   test('cache with sliced access shares cached chunks', async ({ page }) => {
@@ -2222,6 +2230,120 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
     expect(result.data2).toEqual([10, 20, 42, 42])
     expect(result.cacheSize).toBe(2)
     expect(result.cacheSizeAfterSecond).toBe(2)
+  })
+
+
+  test('concurrent reads of the same chunk fetch and decode it once', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      // Wide enough that every task of every caller gets a slot at once —
+      // otherwise the first caller's tasks occupy the pool, settle, and the
+      // later callers never overlap with them at all.
+      const pool = new WorkerPool(8)
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [4],
+        chunk_shape: [2],
+        data_type: 'int32',
+      })
+      await zarr.set(arr, null, {
+        data: new Int32Array([10, 20, 30, 40]),
+        shape: [4],
+        stride: [1],
+      })
+
+      // Hold reads of c/1 open until every caller has asked for it. Only c/1 is
+      // gated: the shape probe reads c/0 before any task runs, so gating that
+      // would stall all three callers before they reached the task phase and
+      // nothing would ever overlap.
+      const originalGet = arr.store.get.bind(arr.store)
+      const chunkPaths: string[] = []
+      let release: () => void = () => {}
+      const gate = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      ;(arr.store as any).get = async (path: string, ...rest: any[]) => {
+        if (path.includes('/c/')) {
+          chunkPaths.push(path)
+          if (path.endsWith('/c/1')) await gate
+        }
+        return originalGet(path, ...rest)
+      }
+
+      const reads = [
+        getWorker(arr, null, { pool }),
+        getWorker(arr, null, { pool }),
+        getWorker(arr, null, { pool }),
+      ]
+      // Let all three pile up on the gate, then let them through together.
+      await new Promise((resolve) => setTimeout(resolve, 100))
+      release()
+      const chunks = await Promise.all(reads)
+
+      pool.terminateWorkers()
+
+      return {
+        // Sharing one decode must not mean sharing a half-filled output.
+        values: chunks.map((chunk) => Array.from(chunk.data as Int32Array)),
+        c1Reads: chunkPaths.filter((path) => path.endsWith('/c/1')).length,
+      }
+    })
+
+    const expected = [10, 20, 30, 40]
+    expect(result.values).toEqual([expected, expected, expected])
+    // Three concurrent callers, one fetch. Without dedup this is 3.
+    expect(result.c1Reads).toBe(1)
+  })
+
+  test('a failed chunk fetch is not remembered by the in-flight map', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(2)
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [4],
+        chunk_shape: [2],
+        data_type: 'int32',
+      })
+      await zarr.set(arr, null, {
+        data: new Int32Array([10, 20, 30, 40]),
+        shape: [4],
+        stride: [1],
+      })
+
+      // Fail c/1 once. Not c/0: the shape probe reads that first and swallows
+      // its errors, so the failure would never reach a chunk task.
+      const originalGet = arr.store.get.bind(arr.store)
+      let failNext = true
+      ;(arr.store as any).get = async (path: string, ...rest: any[]) => {
+        if (path.endsWith('/c/1') && failNext) {
+          failNext = false
+          throw new Error('transient store failure')
+        }
+        return originalGet(path, ...rest)
+      }
+
+      let firstFailed = false
+      try {
+        await getWorker(arr, null, { pool })
+      } catch {
+        firstFailed = true
+      }
+
+      // The store works again. A retry must not replay a held-onto rejection.
+      const retry = await getWorker(arr, null, { pool })
+      pool.terminateWorkers()
+
+      return {
+        firstFailed,
+        retryValues: Array.from(retry.data as Int32Array),
+      }
+    })
+
+    expect(result.firstFailed).toBe(true)
+    expect(result.retryValues).toEqual([10, 20, 30, 40])
   })
 
 })
