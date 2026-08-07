@@ -78,6 +78,25 @@ test('terminate is idempotent and safe before the thread exists', { timeout: 10_
   await assert.rejects(request(worker, { value: 1 }), /terminated/)
 })
 
+test('terminating a live worker rejects the request already in flight', { timeout: 10_000 }, async () => {
+  const worker = createWorker(SQUARE_WORKER)
+
+  // Let the thread genuinely start, so the message reaches a running worker
+  // rather than the pre-startup queue.
+  await request(worker, { value: 2 })
+
+  // Now catch a request in flight. The wait matters: postMessage hands off on a
+  // microtask, so terminating in the same tick is caught by the queued-message
+  // guard instead and this would pass without exercising anything. Once the
+  // message is genuinely on the running thread, the reply dies with it and the
+  // 'exit' handler stays quiet because this exit was requested — so the
+  // rejection has to come from terminate() itself or the caller waits forever.
+  const pending = request(worker, { value: 3, delay: 5_000 })
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  worker.terminate()
+  await assert.rejects(pending, /terminated/)
+})
+
 test('terminating between post and thread startup still rejects the message', { timeout: 10_000 }, async () => {
   const worker = createWorker(SQUARE_WORKER)
   // The message is queued against a thread that does not exist yet, then the

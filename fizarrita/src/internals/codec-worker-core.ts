@@ -72,6 +72,14 @@ function fixEdgeChunkShapeStride<D extends DataType>(
         stride: get_strides(actualChunkShape, "C"),
       }
     }
+    // Fewer elements than the edge shape needs — truncated bytes, or a
+    // chunk_shape that does not describe this data. Returning the chunk as-is
+    // would hand back a shape that overstates the data behind it, and
+    // set_from_chunk_binary would read past the end of it.
+    throw new Error(
+      `Decoded chunk has ${actualElements} elements, fewer than the ` +
+        `${expectedElements} required by chunk shape [${actualChunkShape}].`,
+    )
   }
   // No correction needed or no actualChunkShape provided
   return chunk

@@ -1,8 +1,10 @@
 import { createWorker, isNodeRuntime, WorkerPool } from '../../src/index.js'
 import type { WorkerLike, WorkerPoolTask } from '../../src/index.js'
 
-// URL for the test worker — Vite handles bundling via the ?worker&url suffix.
-const testWorkerUrl = new URL('../browser/test-worker.ts', import.meta.url).href
+// `?worker&url` makes Vite compile the worker and hand back the URL of the
+// emitted JavaScript. Without it the .ts file is treated as a generic asset and
+// ships as TypeScript the browser cannot parse.
+import testWorkerUrl from '../browser/test-worker.ts?worker&url'
 
 /**
  * Helper: run a single task on a worker. This is the canonical task-function
@@ -43,6 +45,10 @@ function createSquareTask(
 function createFailingTask(): WorkerPoolTask<never> {
   return (worker: WorkerLike | null): Promise<{ worker: WorkerLike; result: never }> => {
     const w: WorkerLike = worker ?? new Worker(testWorkerUrl, { type: 'module' })
+    // The pool only recycles workers returned by a resolved task, and its
+    // rejection path does not terminate the one it lent out — so a task that
+    // fails has to clean up after itself or the worker leaks.
+    w.terminate()
     return Promise.reject(new Error('intentional failure'))
   }
 }

@@ -166,8 +166,24 @@ export class NodeWorker implements WorkerLike {
     )
   }
 
+  /**
+   * Stop the worker, failing anything still in flight.
+   *
+   * A request already sitting on a live thread will never be answered once that
+   * thread is killed, and the `'exit'` handler stays quiet here because the exit
+   * was asked for — so without raising it explicitly the caller waits forever.
+   * Terminating mid-request is a request to stop the work, and a rejection is
+   * the honest report of that. A reply that beats termination is simply routed
+   * to a request that has already settled, and ignored.
+   */
   terminate(): void {
+    if (this.terminated) return
     this.terminated = true
+
+    const event: WorkerErrorEventLike = { message: 'Worker has been terminated' }
+    this.fatal ??= event
+    queueMicrotask(() => this.dispatchError(event))
+
     this.thread.then(
       (thread) => {
         thread.terminate().catch(() => {})

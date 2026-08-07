@@ -249,11 +249,25 @@ await getWorker(arr, null, { pool, workerUrl })
 await setWorker(arr, null, data, { pool, workerUrl })
 ```
 
-The built-in workers are also available as subpath exports for direct reference:
+To build a worker yourself instead of passing a `workerUrl`, use
+`createDefaultWorker()`, which returns a ready worker for the current runtime:
 
 ```ts
-import '@fideus-labs/fizarrita/codec-worker'       // browser
-import '@fideus-labs/fizarrita/codec-worker-node'  // node:worker_threads
+import { createDefaultWorker } from '@fideus-labs/fizarrita'
+
+const worker = createDefaultWorker()
+```
+
+The two entries are also reachable as subpath exports, but they are **worker
+entry modules, not importable helpers** — each one attaches a message handler to
+the scope it is loaded in. Importing them on the main thread does not create a
+worker: the browser entry would bind its handler to the page, and the Node entry
+throws outright. Reference them as a worker script, not as an import:
+
+```ts
+// The specifier resolves to the worker file; it is never imported directly.
+const url = import.meta.resolve('@fideus-labs/fizarrita/codec-worker')
+await getWorker(arr, null, { pool, workerUrl: url })
 ```
 
 Both are thin entry points over `handleCodecMessage`, which is exported so a

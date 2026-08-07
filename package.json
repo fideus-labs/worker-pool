@@ -1,6 +1,6 @@
 {
   "name": "@fideus-labs/worker-pool",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "description": "A worker pool with bounded concurrency, for Web Workers and node:worker_threads. ChunkQueue-compatible add/onIdle and batch runTasks/cancel interfaces.",
   "type": "module",
   "main": "./dist/index.js",
