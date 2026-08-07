@@ -155,6 +155,35 @@ function getOrCreatePipelineLegacy(meta: CodecChunkMeta) {
   return pipeline
 }
 
+/**
+ * Resolve the codec pipeline for a decode/encode request: a registered
+ * {@link CodecChunkMeta} by `metaId`, else an inline `meta` from a legacy caller.
+ *
+ * Having neither is a protocol error and has to say so. Handing an absent `meta`
+ * to the legacy path instead reports `Cannot read properties of undefined
+ * (reading 'data_type')`, which names nothing the caller can act on and shifts
+ * with any refactor of the pipeline builder. The real cause is always the same:
+ * a request referencing codec metadata the worker was never sent.
+ */
+function resolvePipeline(
+  metaId: number | undefined,
+  meta: CodecChunkMeta | undefined,
+): {
+  pipeline: ReturnType<typeof create_codec_pipeline>
+  meta: CodecChunkMeta
+} {
+  if (metaId !== undefined && pipelineByMetaId.has(metaId)) {
+    return { pipeline: getPipeline(metaId), meta: metaByMetaId.get(metaId)! }
+  }
+  if (meta === undefined) {
+    throw new Error(
+      `No codec metadata for metaId ${metaId}. Send an 'init' message first, ` +
+        `or include 'meta' in the request.`,
+    )
+  }
+  return { pipeline: getOrCreatePipelineLegacy(meta), meta }
+}
+
 // ---------------------------------------------------------------------------
 // Message handling
 // ---------------------------------------------------------------------------
@@ -235,11 +264,7 @@ export async function handleCodecMessage(
     }
 
     if (msg.type === "decode") {
-      // Resolve pipeline: prefer metaId, fall back to legacy meta
-      const pipeline =
-        msg.metaId !== undefined && pipelineByMetaId.has(msg.metaId)
-          ? getPipeline(msg.metaId)
-          : getOrCreatePipelineLegacy(msg.meta!)
+      const { pipeline } = resolvePipeline(msg.metaId, msg.meta)
 
       const bytes = new Uint8Array(msg.bytes)
       let chunk = (await pipeline.decode(bytes)) as Chunk<DataType>
@@ -307,16 +332,7 @@ export async function handleCodecMessage(
     }
 
     if (msg.type === "encode") {
-      // Resolve pipeline and meta
-      let pipeline: ReturnType<typeof create_codec_pipeline>
-      let meta: CodecChunkMeta
-      if (msg.metaId !== undefined && pipelineByMetaId.has(msg.metaId)) {
-        pipeline = getPipeline(msg.metaId)
-        meta = metaByMetaId.get(msg.metaId)!
-      } else {
-        meta = msg.meta!
-        pipeline = getOrCreatePipelineLegacy(meta)
-      }
+      const { pipeline, meta } = resolvePipeline(msg.metaId, msg.meta)
 
       // Reconstruct a Chunk from the transferred ArrayBuffer
       const Ctr = get_ctr(meta.data_type) as unknown as {

@@ -101,13 +101,15 @@ test('an unrecognised message type produces no reply', async () => {
 })
 
 test('a failure comes back as the request’s own response type', async () => {
-  // No init for this metaId, and no inline meta to fall back on.
+  // No init for this metaId, and no inline meta to fall back on. The error has
+  // to name that cause — a request for codec metadata the worker never got —
+  // rather than whatever the pipeline builder happens to trip over first.
   const cases = [
-    ['decode', 'decoded'],
-    ['encode', 'encoded'],
-    ['decode_into', 'decode_into_ok'],
+    ['decode', 'decoded', /No codec metadata for metaId 999999/],
+    ['encode', 'encoded', /No codec metadata for metaId 999999/],
+    ['decode_into', 'decode_into_ok', /No pipeline for metaId 999999/],
   ]
-  for (const [requestType, responseType] of cases) {
+  for (const [requestType, responseType, expectedError] of cases) {
     const reply = await handleCodecMessage({
       type: requestType,
       id: 8,
@@ -117,10 +119,19 @@ test('a failure comes back as the request’s own response type', async () => {
     })
     assert.equal(reply.response.type, responseType, requestType)
     assert.equal(reply.response.id, 8)
-    assert.equal(typeof reply.response.error, 'string', requestType)
-    assert.ok(reply.response.error.length > 0, requestType)
+    assert.match(reply.response.error, expectedError, requestType)
     assert.deepEqual(reply.transfer, [])
   }
+})
+
+test('a request with neither metaId nor meta says so', async () => {
+  const reply = await handleCodecMessage({
+    type: 'decode',
+    id: 11,
+    bytes: new ArrayBuffer(16),
+  })
+  assert.equal(reply.response.type, 'decoded')
+  assert.match(reply.response.error, /Send an 'init' message first/)
 })
 
 test('a bad codec surfaces as an error reply, not a rejection', async () => {
