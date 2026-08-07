@@ -32,10 +32,13 @@ jobs:
       - name: Typecheck
         run: pnpm -r build
 
+      - name: Run Node tests
+        run: node --test "test/node/*.test.js"
+
       - name: Install Playwright browsers
         run: pnpm exec playwright install --with-deps chromium
 
-      - name: Run tests
+      - name: Run browser tests
         run: pnpm test
 
       - name: Upload test report

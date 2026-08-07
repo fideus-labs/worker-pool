@@ -4,7 +4,7 @@
  */
 
 import { WorkerPool } from '../../../src/index.js'
-import type { WorkerPoolTask } from '../../../src/index.js'
+import type { WorkerLike, WorkerPoolTask } from '../../../src/index.js'
 import type { ChunkQueue, DataType, Chunk } from './types.js'
 import type { ZarrArray } from './store.js'
 
@@ -42,7 +42,7 @@ let nextRequestId = 0
  * Helper: send a decode request to a worker and receive the result.
  */
 function workerDecode<D extends DataType>(
-  worker: Worker,
+  worker: WorkerLike,
   bytes: Uint8Array,
   dtype: D,
   shape: number[],
@@ -89,7 +89,7 @@ function workerDecode<D extends DataType>(
  * Helper: send an encode request to a worker and receive the result.
  */
 function workerEncode<D extends DataType>(
-  worker: Worker,
+  worker: WorkerLike,
   chunk: Chunk<D>,
   dtype: D,
   delay?: number,
@@ -173,9 +173,9 @@ export function createWorkerPoolQueue<D extends DataType>(
         // We intercept by replacing arr.getChunk with a worker-based version
         // for the duration of the fn call.
         const task: WorkerPoolTask<void> = (
-          worker: Worker | null,
-        ): Promise<{ worker: Worker; result: void }> => {
-          const w = worker ?? new Worker(codecWorkerUrl, { type: 'module' })
+          worker: WorkerLike | null,
+        ): Promise<{ worker: WorkerLike; result: void }> => {
+          const w: WorkerLike = worker ?? new Worker(codecWorkerUrl, { type: 'module' })
           const originalGetChunk = arr.getChunk.bind(arr)
 
           // Override getChunk to decode via worker
@@ -200,9 +200,9 @@ export function createWorkerPoolQueue<D extends DataType>(
       } else {
         // For set: wrap fn so that codec.encode goes through the worker.
         const task: WorkerPoolTask<void> = (
-          worker: Worker | null,
-        ): Promise<{ worker: Worker; result: void }> => {
-          const w = worker ?? new Worker(codecWorkerUrl, { type: 'module' })
+          worker: WorkerLike | null,
+        ): Promise<{ worker: WorkerLike; result: void }> => {
+          const w: WorkerLike = worker ?? new Worker(codecWorkerUrl, { type: 'module' })
           const originalEncode = arr.codec.encode.bind(arr.codec)
 
           // Override codec.encode to encode via worker

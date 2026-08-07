@@ -9,7 +9,11 @@
  * Uses WorkerPool.runTasks() for bounded-concurrency scheduling.
  */
 
-import type { WorkerPool, WorkerPoolTask } from "@fideus-labs/worker-pool"
+import type {
+  WorkerLike,
+  WorkerPool,
+  WorkerPoolTask,
+} from "@fideus-labs/worker-pool"
 import type {
   Chunk,
   DataType,
@@ -22,6 +26,7 @@ import type {
   Array as ZarrArray,
 } from "zarrita"
 
+import { createCodecWorker } from "./create-worker.js"
 import { BasicIndexer, type IndexerProjection } from "./internals/indexer.js"
 import { setter } from "./internals/setter.js"
 import {
@@ -38,20 +43,6 @@ import {
   workerEncode,
   workerEncodeShared,
 } from "./worker-rpc.js"
-
-/**
- * Create a Worker using the default codec-worker script bundled with this
- * package.
- *
- * Using `new Worker(new URL(..., import.meta.url))` in a single expression
- * allows bundlers (Vite, Rollup, webpack 5) to detect the worker entry point
- * and bundle its dependency graph into a self-contained asset.
- */
-function createDefaultWorker(): Worker {
-  return new Worker(new URL("./codec-worker.js", import.meta.url), {
-    type: "module",
-  })
-}
 
 /** Shared TextDecoder instance. */
 const decoder = new TextDecoder()
@@ -191,9 +182,12 @@ function is_total_slice(
  *   chunk_shape: [10, 10],
  *   data_type: 'float32',
  * })
- * await setWorker(arr, null, 42.0, { pool })
  *
- * pool.terminateWorkers()
+ * try {
+ *   await setWorker(arr, null, 42.0, { pool })
+ * } finally {
+ *   pool.terminateWorkers()
+ * }
  * ```
  */
 export async function setWorker<D extends DataType>(
@@ -240,12 +234,8 @@ export async function setWorker<D extends DataType>(
     const chunkKey = encodeChunkKey(chunk_coords)
     const chunkPath = arr.resolve(chunkKey).path
 
-    tasks.push(async (workerSlot: Worker | null) => {
-      const worker =
-        workerSlot ??
-        (workerUrl
-          ? new Worker(workerUrl, { type: "module" })
-          : createDefaultWorker())
+    tasks.push(async (workerSlot: WorkerLike | null) => {
+      const worker = workerSlot ?? createCodecWorker(workerUrl)
 
       let chunkData: TypedArray<D>
 

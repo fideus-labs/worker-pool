@@ -1,7 +1,7 @@
 {
   "name": "@fideus-labs/worker-pool",
-  "version": "1.0.0",
-  "description": "A Web Worker pool with bounded concurrency. ChunkQueue-compatible add/onIdle and batch runTasks/cancel interfaces.",
+  "version": "2.0.0",
+  "description": "A worker pool with bounded concurrency, for Web Workers and node:worker_threads. ChunkQueue-compatible add/onIdle and batch runTasks/cancel interfaces.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -21,7 +21,8 @@
     "dev": "vite --config vite.config.ts",
     "bench": "vite --config benchmark/vite.config.ts benchmark",
     "test": "playwright test",
-    "test:ui": "playwright test --ui"
+    "test:ui": "playwright test --ui",
+    "test:node": "pnpm build && pnpm --filter @fideus-labs/fizarrita build && node --test \"test/node/*.test.js\""
   },
   "repository": {
     "type": "git",
@@ -29,7 +30,9 @@
   },
   "keywords": [
     "web-worker",
+    "worker-threads",
     "worker-pool",
+    "node",
     "concurrency",
     "chunk-queue",
     "zarrita",
@@ -38,11 +41,6 @@
   "author": "Fideus Labs LLC <info@fideus.io>",
   "license": "MIT",
   "sideEffects": false,
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "esbuild"
-    ]
-  },
   "devDependencies": {
     "@playwright/test": "^1.58.2",
     "@zarrita/storage": "^0.1.4",
