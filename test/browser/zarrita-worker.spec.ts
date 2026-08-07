@@ -1914,18 +1914,19 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
 
     expect(result.hasGetOps).toBe(true)
     expect(result.hasSetOps).toBe(true)
-    // First call, per chunk: one get when the task list is built (miss), a
-    // second get when the task actually runs (still a miss here — nothing else
-    // is in flight), then one set. Two chunks, so 6 ops.
-    //
-    // The second get is what lets a task pick up a chunk that a concurrent
-    // `getWorker` finished in the interval between the list being built and the
-    // task starting — without it, that task refetches and redecodes something
-    // already sitting in the cache.
-    expect(result.opsAfterFirst.length).toBe(6)
-    // Second call: 2 get hits at build time, so no task is created and no
-    // second get or set happens.
-    expect(result.opsAll.length).toBe(8)
+    // First call does three gets and a set per chunk, each lookup avoiding
+    // strictly more expensive work than itself:
+    //   1. building the task list — a hit means no task at all;
+    //   2. starting the task — a hit means no fetch and no decode, catching a
+    //      chunk a concurrent `getWorker` finished in between;
+    //   3. after the chunk arrives — decides whether this cache still needs it,
+    //      since the chunk may have been produced for a different cache, or for
+    //      none, and must not be written twice.
+    // All three miss here (nothing else is running), so 4 ops x 2 chunks = 8.
+    expect(result.opsAfterFirst.length).toBe(8)
+    // Second call: 2 get hits at build time, so no task is created and neither
+    // the later gets nor the sets happen.
+    expect(result.opsAll.length).toBe(10)
   })
 
   test('cache with sliced access shares cached chunks', async ({ page }) => {
@@ -2259,6 +2260,7 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       // nothing would ever overlap.
       const originalGet = arr.store.get.bind(arr.store)
       const chunkPaths: string[] = []
+      let gatedRequests = 0
       let release: () => void = () => {}
       const gate = new Promise<void>((resolve) => {
         release = resolve
@@ -2266,9 +2268,20 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       ;(arr.store as any).get = async (path: string, ...rest: any[]) => {
         if (path.includes('/c/')) {
           chunkPaths.push(path)
-          if (path.endsWith('/c/1')) await gate
+          if (path.endsWith('/c/1')) {
+            gatedRequests += 1
+            await gate
+          }
         }
         return originalGet(path, ...rest)
+      }
+
+      const waitFor = async (ready: () => boolean, label: string) => {
+        const deadline = Date.now() + 5000
+        while (!ready()) {
+          if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`)
+          await new Promise((resolve) => setTimeout(resolve, 5))
+        }
       }
 
       const reads = [
@@ -2276,8 +2289,22 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
         getWorker(arr, null, { pool }),
         getWorker(arr, null, { pool }),
       ]
-      // Let all three pile up on the gate, then let them through together.
-      await new Promise((resolve) => setTimeout(resolve, 100))
+
+      // Release only once every caller is demonstrably at the point of wanting
+      // c/1, rather than after a fixed sleep.
+      //
+      // The gated-request count cannot be the signal — dedup working means only
+      // one request ever reaches the gate, so waiting for three would hang on a
+      // passing run. The shape probe is the observable that survives dedup: it
+      // reads c/0 once per call, outside the task path, before that call builds
+      // any tasks. Three c/0 reads therefore means all three callers are past
+      // probing and into their task phase, and a task's first act is the
+      // store.get for its chunk — no I/O in between.
+      await waitFor(
+        () => chunkPaths.filter((path) => path.endsWith('/c/0')).length >= 3,
+        'all three callers to finish probing',
+      )
+      await waitFor(() => gatedRequests >= 1, 'the shared c/1 fetch to begin')
       release()
       const chunks = await Promise.all(reads)
 
@@ -2344,6 +2371,89 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
 
     expect(result.firstFailed).toBe(true)
     expect(result.retryValues).toEqual([10, 20, 30, 40])
+  })
+
+
+  test('every concurrent caller gets its own cache populated', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const { zarr, getWorker, WorkerPool } = window
+      const pool = new WorkerPool(8)
+
+      const store = zarr.root()
+      const arr = await zarr.create(store, {
+        shape: [4],
+        chunk_shape: [2],
+        data_type: 'int32',
+      })
+      await zarr.set(arr, null, {
+        data: new Int32Array([10, 20, 30, 40]),
+        shape: [4],
+        stride: [1],
+      })
+
+      const originalGet = arr.store.get.bind(arr.store)
+      const chunkPaths: string[] = []
+      let gatedRequests = 0
+      let release: () => void = () => {}
+      const gate = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      ;(arr.store as any).get = async (path: string, ...rest: any[]) => {
+        if (path.includes('/c/')) {
+          chunkPaths.push(path)
+          if (path.endsWith('/c/1')) {
+            gatedRequests += 1
+            await gate
+          }
+        }
+        return originalGet(path, ...rest)
+      }
+
+      const waitFor = async (ready: () => boolean, label: string) => {
+        const deadline = Date.now() + 5000
+        while (!ready()) {
+          if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`)
+          await new Promise((resolve) => setTimeout(resolve, 5))
+        }
+      }
+
+      // Two readers of the same chunk holding *different* caches. Sharing is
+      // keyed on the chunk, so only one of them fetches and decodes — but both
+      // asked for caching, so both caches have to end up holding the result.
+      const cacheA = new Map()
+      const cacheB = new Map()
+      const reads = [
+        getWorker(arr, null, { pool, cache: cacheA }),
+        getWorker(arr, null, { pool, cache: cacheB }),
+      ]
+
+      await waitFor(
+        () => chunkPaths.filter((path) => path.endsWith('/c/0')).length >= 2,
+        'both callers to finish probing',
+      )
+      await waitFor(() => gatedRequests >= 1, 'the shared c/1 fetch to begin')
+      release()
+      await Promise.all(reads)
+
+      pool.terminateWorkers()
+
+      const c1Key = [...cacheA.keys()].find((key) => key.endsWith('c/1'))
+
+      return {
+        c1Reads: chunkPaths.filter((path) => path.endsWith('/c/1')).length,
+        cacheASize: cacheA.size,
+        cacheBSize: cacheB.size,
+        // The very same decoded chunk, not two copies of it.
+        sameChunkObject: !!c1Key && cacheA.get(c1Key) === cacheB.get(c1Key),
+      }
+    })
+
+    // Still deduped: one fetch across both callers.
+    expect(result.c1Reads).toBe(1)
+    // ...and neither caller was silently denied its cache entry.
+    expect(result.cacheASize).toBe(2)
+    expect(result.cacheBSize).toBe(2)
+    expect(result.sameChunkObject).toBe(true)
   })
 
 })

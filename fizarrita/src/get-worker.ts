@@ -887,13 +887,10 @@ export async function getWorker<
       const chunk = await shareInFlightChunk<D>(cacheKey, async () => {
         const rawBytes = await arr.store.get(chunkPath, opts.opts)
         if (!rawBytes) {
-          const fillChunk = buildFillChunk()
-          cache.set(cacheKey, fillChunk)
-          return fillChunk
+          return buildFillChunk()
         }
-        let decoded: Chunk<D>
         try {
-          decoded = await workerDecode<D>(
+          return await workerDecode<D>(
             worker,
             rawBytes,
             metaId,
@@ -904,12 +901,23 @@ export async function getWorker<
           worker.terminate()
           throw error
         }
-        // Cached by the producer only. Letting every sharer re-`set` the same
-        // object would be a redundant write, and a cache with dispose semantics
-        // would see its own live entry displaced by itself.
-        cache.set(cacheKey, decoded)
-        return decoded
       })
+
+      // Populate *this* read's cache, whoever produced the chunk. Sharing is
+      // keyed on the chunk, not on the cache, so the producer may have been a
+      // concurrent read holding a different cache instance — or none at all.
+      // Leaving the write to the producer would mean a caller that supplied a
+      // cache silently not getting it filled, which is the `cache` contract
+      // ("on a cache miss the decoded chunk is stored for future use") quietly
+      // not holding.
+      //
+      // Guarded rather than unconditional so no cache is handed an entry it
+      // already holds: with a shared chunk that write is not merely redundant,
+      // it displaces a live entry with itself, which a cache that disposes on
+      // overwrite would act on.
+      if (!cache.get(cacheKey)) {
+        cache.set(cacheKey, chunk)
+      }
 
       setter.set_from_chunk(out, chunk, mapping)
 
