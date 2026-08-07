@@ -221,6 +221,34 @@ test.describe('WorkerPool', () => {
     expect(result.error).toContain('intentional failure')
   })
 
+  test('error handling: a rejected task gives its slot back', async ({ page }) => {
+    const result = await page.evaluate(async () => {
+      const pool = new window.WorkerPool(2)
+
+      // Fail once for every slot in the pool.
+      for (let i = 0; i < 2; i++) {
+        await pool.runTasks([window.createFailingTask()]).promise.catch(() => {})
+      }
+
+      const slots = pool.workerQueue.length
+
+      // A pool that dropped a slot per failure has none left to hand out and
+      // this batch never starts, so race it instead of hanging the test out to
+      // its timeout.
+      pool.add(window.createSquareTask(8))
+      const results = await Promise.race([
+        pool.onIdle<number>(),
+        new Promise<number[]>(resolve => setTimeout(() => resolve(['never scheduled' as unknown as number]), 2000)),
+      ])
+
+      pool.terminateWorkers()
+      return { slots, results }
+    })
+
+    expect(result.slots).toBe(2)
+    expect(result.results).toEqual([64])
+  })
+
   test('large batch: pool of 2 handles 20 tasks correctly', async ({ page }) => {
     const results = await page.evaluate(async () => {
       const pool = new window.WorkerPool(2)
