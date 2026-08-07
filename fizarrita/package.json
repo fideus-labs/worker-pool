@@ -1,7 +1,7 @@
 {
   "name": "@fideus-labs/fizarrita",
-  "version": "1.4.1",
-  "description": "Worker-pool-accelerated get/set for zarrita.js — offloads codec encode/decode to Web Workers.",
+  "version": "1.5.0",
+  "description": "Worker-pool-accelerated get/set for zarrita.js — offloads codec encode/decode to Web Workers or node:worker_threads.",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -13,6 +13,14 @@
     "./codec-worker": {
       "types": "./dist/codec-worker.d.ts",
       "import": "./dist/codec-worker.js"
+    },
+    "./codec-worker-node": {
+      "types": "./dist/codec-worker-node.d.ts",
+      "import": "./dist/codec-worker-node.js"
+    },
+    "./internals/codec-worker-core": {
+      "types": "./dist/internals/codec-worker-core.d.ts",
+      "import": "./dist/internals/codec-worker-core.js"
     },
     "./internals/codec-pipeline": {
       "types": "./dist/internals/codec-pipeline.d.ts",
@@ -56,6 +64,8 @@
     "zarrita",
     "zarr",
     "web-worker",
+    "worker-threads",
+    "node",
     "worker-pool",
     "codec",
     "compression"

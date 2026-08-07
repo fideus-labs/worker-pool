@@ -1,6 +1,9 @@
 # @fideus-labs/fizarrita
 
-Worker-pool-accelerated `get`/`set` for [zarrita.js](https://github.com/manzt/zarrita.js) — offloads codec encode/decode to Web Workers via [@fideus-labs/worker-pool](https://github.com/fideus-labs/worker-pool).
+Worker-pool-accelerated `get`/`set` for [zarrita.js](https://github.com/manzt/zarrita.js) — offloads codec encode/decode to workers via [@fideus-labs/worker-pool](https://github.com/fideus-labs/worker-pool).
+
+Runs in the browser on Web Workers and in Node on `node:worker_threads`; the
+right codec worker is picked for you. See [Node.js](#nodejs).
 
 ## Installation
 
@@ -20,13 +23,15 @@ const pool = new WorkerPool(navigator.hardwareConcurrency ?? 4)
 const store = new zarr.FetchStore('https://example.com/data.zarr')
 const arr = await zarr.open(store, { kind: 'array' })
 
-// Read — codec decode runs on workers
-const chunk = await getWorker(arr, null, { pool })
+try {
+  // Read — codec decode runs on workers
+  const chunk = await getWorker(arr, null, { pool })
 
-// Write — codec encode runs on workers
-await setWorker(arr, null, chunk, { pool })
-
-pool.terminateWorkers()
+  // Write — codec encode runs on workers
+  await setWorker(arr, null, chunk, { pool })
+} finally {
+  pool.terminateWorkers()
+}
 ```
 
 ## API
@@ -179,6 +184,46 @@ interface ChunkCache {
 }
 ```
 
+## Node.js
+
+`getWorker` and `setWorker` work in plain Node with no extra setup. The package
+ships two codec worker entries — `codec-worker.js` for the browser and
+`codec-worker-node.js` for `node:worker_threads` — and `createDefaultWorker`
+selects between them at runtime.
+
+```ts
+import { WorkerPool } from '@fideus-labs/worker-pool'
+import { getWorker, setWorker } from '@fideus-labs/fizarrita'
+import * as zarr from 'zarrita'
+
+const store = new Map()
+const arr = await zarr.create(zarr.root(store).resolve('/data'), {
+  shape: [1024, 1024],
+  chunk_shape: [256, 256],
+  data_type: 'int32',
+})
+
+const pool = new WorkerPool(4)
+try {
+  await setWorker(arr, null, 42, { pool })
+  const chunk = await getWorker(arr, null, { pool })
+} finally {
+  // Required in Node: worker threads hold the event loop open.
+  pool.terminateWorkers()
+}
+```
+
+Notes:
+
+- **Always call `pool.terminateWorkers()`** — otherwise the Node process will
+  not exit.
+- **`useSharedArrayBuffer` works in Node**, and needs no COOP/COEP headers there;
+  `SharedArrayBuffer` is available unconditionally.
+- **Codec availability is zarrita's, not ours.** zarrita ships working `zstd`,
+  `blosc`, `lz4`, and `bytes` implementations; `gzip` and `crc32c` need a codec
+  registered from `numcodecs`, in the worker, via a
+  [custom codec worker](#custom-codec-worker).
+
 ## Worker message protocol
 
 The built-in codec worker handles four message types:
@@ -204,11 +249,15 @@ await getWorker(arr, null, { pool, workerUrl })
 await setWorker(arr, null, data, { pool, workerUrl })
 ```
 
-The built-in worker is also available as a subpath export for direct reference:
+The built-in workers are also available as subpath exports for direct reference:
 
 ```ts
-import '@fideus-labs/fizarrita/codec-worker'
+import '@fideus-labs/fizarrita/codec-worker'       // browser
+import '@fideus-labs/fizarrita/codec-worker-node'  // node:worker_threads
 ```
+
+Both are thin entry points over `handleCodecMessage`, which is exported so a
+custom worker can extend the protocol without reimplementing it.
 
 ## License
 

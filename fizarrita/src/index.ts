@@ -6,12 +6,15 @@
  * WorkerPool with bounded concurrency.
  */
 
-export type { ArrayMetadata } from "./get-worker.js"
 export {
-  createCacheKey,
+  createCodecWorker,
   createDefaultWorker,
   /** @deprecated Use {@link createDefaultWorker} instead. */
   DEFAULT_WORKER_URL,
+} from "./create-worker.js"
+export type { ArrayMetadata } from "./get-worker.js"
+export {
+  createCacheKey,
   getStoreId,
   getWorker,
   hasSizeChangingCodec,
@@ -23,6 +26,11 @@ export {
 } from "./get-worker.js"
 // Internals — exported for building custom workers that extend the codec worker
 export { create_codec_pipeline } from "./internals/codec-pipeline.js"
+export type {
+  CodecWorkerMessage,
+  CodecWorkerReply,
+} from "./internals/codec-worker-core.js"
+export { handleCodecMessage } from "./internals/codec-worker-core.js"
 export type { ChunkProjection, IndexerProjection } from "./internals/indexer.js"
 export {
   BasicIndexer,

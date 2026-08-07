@@ -9,7 +9,11 @@
  * Uses WorkerPool.runTasks() for bounded-concurrency scheduling.
  */
 
-import type { WorkerPool, WorkerPoolTask } from "@fideus-labs/worker-pool"
+import type {
+  WorkerLike,
+  WorkerPool,
+  WorkerPoolTask,
+} from "@fideus-labs/worker-pool"
 import type {
   Chunk,
   CodecMetadata,
@@ -20,6 +24,7 @@ import type {
   Array as ZarrArray,
 } from "zarrita"
 
+import { createCodecWorker } from "./create-worker.js"
 import { create_codec_pipeline } from "./internals/codec-pipeline.js"
 import { BasicIndexer } from "./internals/indexer.js"
 import { setter } from "./internals/setter.js"
@@ -32,33 +37,6 @@ import {
 } from "./internals/util.js"
 import type { ChunkCache, CodecChunkMeta, GetWorkerOptions } from "./types.js"
 import { getMetaId, workerDecode, workerDecodeInto } from "./worker-rpc.js"
-
-/**
- * Default URL for the codec worker. Uses `import.meta.url` to resolve
- * relative to this module.
- *
- * @deprecated Use {@link createDefaultWorker} instead — it produces a
- *   `new Worker(new URL(..., import.meta.url))` expression that bundlers
- *   like Vite recognise as a worker entry point and bundle accordingly.
- */
-export const DEFAULT_WORKER_URL = new URL("./codec-worker.js", import.meta.url)
-
-/**
- * Create a Worker using the default codec-worker script bundled with this
- * package.
- *
- * Using `new Worker(new URL(..., import.meta.url))` in a single expression
- * allows bundlers (Vite, Rollup, webpack 5) to detect the worker entry point
- * and bundle its dependency graph into a self-contained asset. The previous
- * approach — storing the URL in a variable and passing it to `new Worker()`
- * separately — caused bundlers to treat the worker file as a plain static
- * asset, leaving its relative `./internals/*` imports unresolved.
- */
-export function createDefaultWorker(): Worker {
-  return new Worker(new URL("./codec-worker.js", import.meta.url), {
-    type: "module",
-  })
-}
 
 /** Shared TextDecoder instance. */
 const decoder = new TextDecoder()
@@ -695,9 +673,12 @@ export async function probeActualChunkShape<
  * const pool = new WorkerPool(4)
  * const store = new zarr.FetchStore('https://example.com/data.zarr')
  * const arr = await zarr.open(store, { kind: 'array' })
- * const result = await getWorker(arr, null, { pool })
  *
- * pool.terminateWorkers()
+ * try {
+ *   const result = await getWorker(arr, null, { pool })
+ * } finally {
+ *   pool.terminateWorkers()
+ * }
  * ```
  */
 export async function getWorker<
@@ -789,12 +770,8 @@ export async function getWorker<
       continue
     }
 
-    tasks.push(async (workerSlot: Worker | null) => {
-      const worker =
-        workerSlot ??
-        (workerUrl
-          ? new Worker(workerUrl, { type: "module" })
-          : createDefaultWorker())
+    tasks.push(async (workerSlot: WorkerLike | null) => {
+      const worker = workerSlot ?? createCodecWorker(workerUrl)
 
       // Fetch raw bytes from store on main thread
       const rawBytes = await arr.store.get(chunkPath, opts.opts)

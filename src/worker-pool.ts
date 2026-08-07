@@ -2,11 +2,15 @@ import type {
   WorkerPoolTask,
   WorkerPoolProgressCallback,
   WorkerPoolRunTasksResult,
+  WorkerLike,
   RunInfo,
 } from './types.js'
 
 /**
- * A pool of Web Workers that schedules tasks with bounded concurrency.
+ * A pool of workers that schedules tasks with bounded concurrency.
+ *
+ * Worker slots are typed as {@link WorkerLike}, so the same pool drives browser
+ * `Worker`s and `node:worker_threads` workers (see `createWorker`).
  *
  * Provides two usage patterns:
  *
@@ -20,7 +24,7 @@ import type {
  */
 class WorkerPool {
   /** Available (idle) workers. Uses LIFO (push/pop) for warm reuse. */
-  workerQueue: Array<Worker | null>
+  workerQueue: Array<WorkerLike | null>
 
   /** Bookkeeping for each `runTasks` / `onIdle` invocation. */
   private runInfo: Array<RunInfo<unknown>>
@@ -35,7 +39,7 @@ class WorkerPool {
    * @param poolSize - Maximum number of concurrent web workers.
    */
   constructor(poolSize: number) {
-    this.workerQueue = new Array<Worker | null>(poolSize)
+    this.workerQueue = new Array<WorkerLike | null>(poolSize)
     this.workerQueue.fill(null)
     this.runInfo = []
     this.pendingTasks = []
@@ -48,7 +52,7 @@ class WorkerPool {
   /**
    * Enqueue a single task for execution.
    *
-   * The provided function receives an available `Worker` (or `null` when a new
+   * The provided function receives an available worker (or `null` when a new
    * worker should be created) and must return `{ worker, result }` so the pool
    * can recycle the worker.
    *
@@ -182,7 +186,7 @@ class WorkerPool {
     }
 
     if (this.workerQueue.length > 0) {
-      const worker = this.workerQueue.pop() as Worker | null
+      const worker = this.workerQueue.pop() as WorkerLike | null
       info!.runningWorkers++
 
       task(worker)

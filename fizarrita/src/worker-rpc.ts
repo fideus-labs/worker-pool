@@ -7,6 +7,11 @@
  *   - Zero-copy buffer transfer when the TypedArray already owns its buffer
  */
 
+import type {
+  WorkerErrorEventLike,
+  WorkerLike,
+  WorkerMessageEventLike,
+} from '@fideus-labs/worker-pool'
 import type { Chunk, DataType, TypedArray } from 'zarrita'
 import { get_ctr } from './internals/util.js'
 import type { CodecChunkMeta, Projection } from './types.js'
@@ -29,12 +34,12 @@ class WorkerDispatcher {
   /** Tracks which metaIds have been sent to this worker. */
   private sentMetas = new Set<number>()
 
-  constructor(private worker: Worker) {
+  constructor(private worker: WorkerLike) {
     worker.addEventListener('message', this.onMessage)
     worker.addEventListener('error', this.onError)
   }
 
-  private onMessage = (event: MessageEvent): void => {
+  private onMessage = (event: WorkerMessageEventLike): void => {
     const { id } = event.data
     const req = this.pending.get(id)
     if (!req) return
@@ -47,7 +52,7 @@ class WorkerDispatcher {
     }
   }
 
-  private onError = (err: ErrorEvent): void => {
+  private onError = (err: WorkerErrorEventLike): void => {
     // Reject all pending requests on worker error
     const error = new Error(err.message ?? 'Worker error')
     for (const req of this.pending.values()) {
@@ -56,7 +61,7 @@ class WorkerDispatcher {
     this.pending.clear()
   }
 
-  send(id: number, message: unknown, transfer: Transferable[]): Promise<unknown> {
+  send(id: number, message: unknown, transfer: ArrayBuffer[]): Promise<unknown> {
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject })
       this.worker.postMessage(message, transfer)
@@ -80,9 +85,9 @@ class WorkerDispatcher {
 }
 
 /** Map from Worker to its dispatcher. WeakMap so dispatchers are GC'd with workers. */
-const dispatchers = new WeakMap<Worker, WorkerDispatcher>()
+const dispatchers = new WeakMap<WorkerLike, WorkerDispatcher>()
 
-function getDispatcher(worker: Worker): WorkerDispatcher {
+function getDispatcher(worker: WorkerLike): WorkerDispatcher {
   let d = dispatchers.get(worker)
   if (!d) {
     d = new WorkerDispatcher(worker)
@@ -175,7 +180,7 @@ async function ensureMeta(
  *   edge chunks that may be smaller than chunk_shape from metadata.
  */
 export async function workerDecode<D extends DataType>(
-  worker: Worker,
+  worker: WorkerLike,
   bytes: Uint8Array,
   metaId: number,
   meta: CodecChunkMeta,
@@ -220,7 +225,7 @@ export async function workerDecode<D extends DataType>(
  * Send chunk data to a codec worker for encoding and return the encoded bytes.
  */
 export async function workerEncode<D extends DataType>(
-  worker: Worker,
+  worker: WorkerLike,
   data: TypedArray<D>,
   metaId: number,
   meta: CodecChunkMeta,
@@ -263,7 +268,7 @@ export async function workerEncode<D extends DataType>(
  * result is still transferred back as a regular ArrayBuffer.
  */
 export async function workerEncodeShared<D extends DataType>(
-  worker: Worker,
+  worker: WorkerLike,
   data: TypedArray<D>,
   metaId: number,
   meta: CodecChunkMeta,
@@ -308,7 +313,7 @@ export async function workerEncodeShared<D extends DataType>(
  * Only usable when the output is backed by SharedArrayBuffer.
  */
 export async function workerDecodeInto(
-  worker: Worker,
+  worker: WorkerLike,
   bytes: Uint8Array,
   metaId: number,
   meta: CodecChunkMeta,

@@ -1,3 +1,9 @@
 packages:
   - '.'
   - 'fizarrita'
+
+# Build scripts are opt-in. pnpm 11 reads this here; the `pnpm` field in
+# package.json is no longer consulted, and leaving esbuild unapproved makes
+# `pnpm install` — and so every pnpm script — exit non-zero.
+allowBuilds:
+  esbuild: true

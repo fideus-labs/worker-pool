@@ -1,0 +1,372 @@
+/**
+ * Codec worker message handling, independent of how messages arrive.
+ *
+ * The browser entry (`codec-worker.ts`) drives this from
+ * `self.addEventListener('message', ...)`; the Node entry
+ * (`codec-worker-node.ts`) drives it from `parentPort.on('message', ...)`.
+ * Keeping the logic here means the two entries are a handful of lines each and
+ * neither runtime's globals leak into the other's bundle.
+ *
+ * Message protocol:
+ *   init:        { type: 'init', id, metaId, meta: CodecChunkMeta }
+ *                -> { type: 'init_ok', id }
+ *
+ *   decode:      { type: 'decode', id, bytes: ArrayBuffer, metaId }
+ *                -> { type: 'decoded', id, data: ArrayBuffer, shape, stride }
+ *
+ *   decode_into: { type: 'decode_into', id, bytes, metaId, output: SAB, ... }
+ *                -> { type: 'decode_into_ok', id }
+ *                Worker decodes and writes directly into SharedArrayBuffer.
+ *
+ *   encode:      { type: 'encode', id, data: ArrayBuffer, metaId }
+ *                -> { type: 'encoded', id, bytes: ArrayBuffer }
+ */
+
+import type { Chunk, DataType } from "zarrita"
+
+import type { CodecChunkMeta, Projection } from "../types.js"
+import { create_codec_pipeline } from "./codec-pipeline.js"
+import { compat_chunk, set_from_chunk_binary } from "./setter.js"
+import { get_ctr, get_strides } from "./util.js"
+
+// ---------------------------------------------------------------------------
+// Edge chunk shape correction
+// ---------------------------------------------------------------------------
+
+/**
+ * Fix a decoded chunk's shape and stride when the actual data size differs
+ * from the metadata chunk_shape. This happens with edge chunks — zarr v3
+ * stores edge chunks at their actual smaller size, but our codec pipeline
+ * always reports shape = chunk_shape from metadata.
+ *
+ * If actualChunkShape is provided, use it directly. Otherwise, infer from
+ * the decoded data size vs the metadata chunk_shape.
+ */
+function fixEdgeChunkShapeStride<D extends DataType>(
+  chunk: Chunk<D>,
+  actualChunkShape?: number[],
+): Chunk<D> {
+  if (actualChunkShape) {
+    const expectedElements = actualChunkShape.reduce((a, b) => a * b, 1)
+    const actualElements = (chunk.data as unknown as ArrayLike<unknown>).length
+    if (actualElements === expectedElements) {
+      // Decoded size matches the actual edge shape — just fix shape/stride
+      return {
+        data: chunk.data,
+        shape: actualChunkShape,
+        stride: get_strides(actualChunkShape, "C"),
+      }
+    }
+    if (actualElements > expectedElements) {
+      // Decoded chunk is padded to full chunk_shape (e.g. by setWorker).
+      // Extract the valid sub-region into a compact contiguous buffer.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const src = chunk.data as any
+      const Ctr = src.constructor as new (n: number) => typeof src
+      const dst = new Ctr(expectedElements)
+      const srcStrides = get_strides(chunk.shape, "C")
+      copySubRegion(src, srcStrides, dst, actualChunkShape)
+      return {
+        data: dst as typeof chunk.data,
+        shape: actualChunkShape,
+        stride: get_strides(actualChunkShape, "C"),
+      }
+    }
+  }
+  // No correction needed or no actualChunkShape provided
+  return chunk
+}
+
+/**
+ * Copy a sub-region from a padded C-order buffer into a compact destination.
+ *
+ * For each dimension, copies only the first `subShape[d]` elements along
+ * that axis from the source (which has strides `srcStrides`).
+ */
+function copySubRegion(
+  src: { readonly [i: number]: unknown; readonly length: number },
+  srcStrides: number[],
+  dst: { [i: number]: unknown; length: number },
+  subShape: number[],
+  srcOffset = 0,
+  dstOffset = 0,
+  dim = 0,
+): void {
+  if (dim === subShape.length - 1) {
+    // Innermost dimension — copy contiguous run
+    for (let i = 0; i < subShape[dim]; i++) {
+      dst[dstOffset + i] = src[srcOffset + i]
+    }
+    return
+  }
+  const dstStride = subShape.slice(dim + 1).reduce((a, b) => a * b, 1)
+  for (let i = 0; i < subShape[dim]; i++) {
+    copySubRegion(
+      src,
+      srcStrides,
+      dst,
+      subShape,
+      srcOffset + i * srcStrides[dim],
+      dstOffset + i * dstStride,
+      dim + 1,
+    )
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Codec pipeline cache — keyed by metaId (integer lookup, no JSON.stringify)
+// ---------------------------------------------------------------------------
+
+const pipelineByMetaId = new Map<
+  number,
+  ReturnType<typeof create_codec_pipeline>
+>()
+
+const metaByMetaId = new Map<number, CodecChunkMeta>()
+
+// Legacy fallback: pipeline cache keyed by JSON string (for any decode/encode
+// messages that arrive with a full `meta` object instead of `metaId`)
+const pipelineByKey = new Map<
+  string,
+  ReturnType<typeof create_codec_pipeline>
+>()
+
+function getPipeline(metaId: number): ReturnType<typeof create_codec_pipeline> {
+  const pipeline = pipelineByMetaId.get(metaId)
+  if (!pipeline) {
+    throw new Error(
+      `No pipeline for metaId ${metaId}. Send an 'init' message first.`,
+    )
+  }
+  return pipeline
+}
+
+function getOrCreatePipelineLegacy(meta: CodecChunkMeta) {
+  const key = JSON.stringify(meta)
+  let pipeline = pipelineByKey.get(key)
+  if (!pipeline) {
+    pipeline = create_codec_pipeline({
+      data_type: meta.data_type,
+      shape: meta.chunk_shape,
+      codecs: meta.codecs,
+    })
+    pipelineByKey.set(key, pipeline)
+  }
+  return pipeline
+}
+
+// ---------------------------------------------------------------------------
+// Message handling
+// ---------------------------------------------------------------------------
+
+export type CodecWorkerMessage =
+  | { type: "init"; id: number; metaId: number; meta: CodecChunkMeta }
+  | {
+      type: "decode"
+      id: number
+      bytes: ArrayBuffer
+      metaId?: number
+      meta?: CodecChunkMeta
+      actualChunkShape?: number[]
+    }
+  | {
+      type: "decode_into"
+      id: number
+      bytes: ArrayBuffer
+      metaId: number
+      output: SharedArrayBuffer
+      outputByteLength: number
+      outputStride: number[]
+      projections: Projection[]
+      bytesPerElement: number
+      actualChunkShape?: number[]
+    }
+  | {
+      type: "encode"
+      id: number
+      data: ArrayBuffer
+      metaId?: number
+      meta?: CodecChunkMeta
+    }
+
+/** A reply to post back, with the buffers to hand over rather than copy. */
+export interface CodecWorkerReply {
+  response: Record<string, unknown>
+  transfer: ArrayBuffer[]
+}
+
+/** The response type each request is answered with, including on failure. */
+function responseTypeFor(requestType: CodecWorkerMessage["type"]): string {
+  switch (requestType) {
+    case "decode":
+      return "decoded"
+    case "encode":
+      return "encoded"
+    case "decode_into":
+      return "decode_into_ok"
+    default:
+      return "init_ok"
+  }
+}
+
+/**
+ * Handle one codec worker request.
+ *
+ * Never rejects: a failure comes back as the request's normal response type
+ * carrying an `error` string, which is what the main-thread dispatcher routes
+ * back to the waiting caller.
+ *
+ * @returns The reply to post, or `null` for an unrecognised message type.
+ */
+export async function handleCodecMessage(
+  msg: CodecWorkerMessage,
+): Promise<CodecWorkerReply | null> {
+  try {
+    if (msg.type === "init") {
+      // Register codec metadata and pre-create pipeline
+      metaByMetaId.set(msg.metaId, msg.meta)
+      const pipeline = create_codec_pipeline({
+        data_type: msg.meta.data_type,
+        shape: msg.meta.chunk_shape,
+        codecs: msg.meta.codecs,
+      })
+      pipelineByMetaId.set(msg.metaId, pipeline)
+      return { response: { type: "init_ok", id: msg.id }, transfer: [] }
+    }
+
+    if (msg.type === "decode") {
+      // Resolve pipeline: prefer metaId, fall back to legacy meta
+      const pipeline =
+        msg.metaId !== undefined && pipelineByMetaId.has(msg.metaId)
+          ? getPipeline(msg.metaId)
+          : getOrCreatePipelineLegacy(msg.meta!)
+
+      const bytes = new Uint8Array(msg.bytes)
+      let chunk = (await pipeline.decode(bytes)) as Chunk<DataType>
+
+      // Fix shape/stride for edge chunks (smaller than metadata chunk_shape)
+      chunk = fixEdgeChunkShapeStride(chunk, msg.actualChunkShape)
+
+      // Extract the underlying ArrayBuffer from the decoded TypedArray
+      const dataView = chunk.data as unknown as {
+        buffer: ArrayBuffer
+        byteOffset: number
+        byteLength: number
+      }
+      const buffer = dataView.buffer
+      const byteOffset = dataView.byteOffset
+      const byteLength = dataView.byteLength
+
+      // If the decoded data doesn't own the full buffer, copy for clean transfer
+      let transferBuffer: ArrayBuffer
+      if (byteOffset === 0 && byteLength === buffer.byteLength) {
+        transferBuffer = buffer
+      } else {
+        transferBuffer = buffer.slice(byteOffset, byteOffset + byteLength)
+      }
+
+      return {
+        response: {
+          type: "decoded",
+          id: msg.id,
+          data: transferBuffer,
+          shape: chunk.shape,
+          stride: chunk.stride,
+        },
+        transfer: [transferBuffer],
+      }
+    }
+
+    if (msg.type === "decode_into") {
+      // Decode and write directly into SharedArrayBuffer — no transfer back
+      const pipeline = getPipeline(msg.metaId)
+      const bytes = new Uint8Array(msg.bytes)
+      let chunk = (await pipeline.decode(bytes)) as Chunk<DataType>
+
+      // Fix shape/stride for edge chunks (smaller than metadata chunk_shape)
+      chunk = fixEdgeChunkShapeStride(chunk, msg.actualChunkShape)
+
+      // Create a Uint8Array view over the shared output buffer
+      const destView = new Uint8Array(msg.output, 0, msg.outputByteLength)
+
+      // Convert decoded chunk to byte-level representation
+      const src = compat_chunk(chunk)
+
+      // Write decoded data directly into the shared output memory
+      set_from_chunk_binary(
+        { data: destView, stride: msg.outputStride },
+        src,
+        msg.bytesPerElement,
+        msg.projections,
+      )
+
+      return {
+        response: { type: "decode_into_ok", id: msg.id },
+        transfer: [],
+      }
+    }
+
+    if (msg.type === "encode") {
+      // Resolve pipeline and meta
+      let pipeline: ReturnType<typeof create_codec_pipeline>
+      let meta: CodecChunkMeta
+      if (msg.metaId !== undefined && pipelineByMetaId.has(msg.metaId)) {
+        pipeline = getPipeline(msg.metaId)
+        meta = metaByMetaId.get(msg.metaId)!
+      } else {
+        meta = msg.meta!
+        pipeline = getOrCreatePipelineLegacy(meta)
+      }
+
+      // Reconstruct a Chunk from the transferred ArrayBuffer
+      const Ctr = get_ctr(meta.data_type) as unknown as {
+        new (buf: ArrayBuffer, off: number, len: number): unknown
+        BYTES_PER_ELEMENT: number
+      }
+      const data = new Ctr(
+        msg.data,
+        0,
+        msg.data.byteLength / Ctr.BYTES_PER_ELEMENT,
+      )
+      const shape = meta.chunk_shape
+      const stride = get_strides(shape, "C")
+
+      const chunk = { data, shape, stride } as Chunk<DataType>
+      const encoded = await pipeline.encode(chunk)
+
+      // Transfer the encoded bytes back. The pipeline always encodes into a
+      // plain ArrayBuffer — the only shared buffer in play is the caller's, and
+      // `workerEncodeShared` copies out of it before sending.
+      const encodedView = encoded as unknown as {
+        buffer: ArrayBuffer
+        byteOffset: number
+        byteLength: number
+      }
+      const transferBuffer =
+        encodedView.byteOffset === 0 &&
+        encodedView.byteLength === encodedView.buffer.byteLength
+          ? encodedView.buffer
+          : encodedView.buffer.slice(
+              encodedView.byteOffset,
+              encodedView.byteOffset + encodedView.byteLength,
+            )
+
+      return {
+        response: { type: "encoded", id: msg.id, bytes: transferBuffer },
+        transfer: [transferBuffer],
+      }
+    }
+
+    return null
+  } catch (error) {
+    // Send error back to main thread
+    return {
+      response: {
+        type: responseTypeFor(msg.type),
+        id: msg.id,
+        error: error instanceof Error ? error.message : String(error),
+      },
+      transfer: [],
+    }
+  }
+}
