@@ -45,9 +45,9 @@ function createSquareTask(
 function createFailingTask(): WorkerPoolTask<never> {
   return (worker: WorkerLike | null): Promise<{ worker: WorkerLike; result: never }> => {
     const w: WorkerLike = worker ?? new Worker(testWorkerUrl, { type: 'module' })
-    // The pool only recycles workers returned by a resolved task, and its
-    // rejection path does not terminate the one it lent out — so a task that
-    // fails has to clean up after itself or the worker leaks.
+    // The pool terminates the worker it lent out when a task rejects, but it
+    // never sees one the task created for itself — so a failing task still has
+    // to clean up after itself or that worker leaks.
     w.terminate()
     return Promise.reject(new Error('intentional failure'))
   }

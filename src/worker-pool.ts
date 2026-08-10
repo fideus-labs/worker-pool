@@ -106,6 +106,7 @@ class WorkerPool {
       completedTasks: 0,
       progressCallback,
       canceled: false,
+      cleared: false,
     }
     this.runInfo.push(info as RunInfo<unknown>)
     info.index = this.runInfo.length - 1
@@ -163,8 +164,9 @@ class WorkerPool {
   /**
    * Core scheduler. Three branches:
    *
-   * 1. **Worker available** — pop it, run the task, recycle the worker on
-   *    completion, then chain-schedule the next queued task.
+   * 1. **Worker available** — pop it, run the task, return the slot once the
+   *    task settles (recycled on success, emptied on failure), then
+   *    chain-schedule the next queued task.
    * 2. **No worker, but work in progress** — push onto the overflow queue;
    *    a completing worker will pick it up.
    * 3. **No worker, nothing in progress** — retry after a short delay (handles
@@ -189,12 +191,43 @@ class WorkerPool {
       const worker = this.workerQueue.pop() as WorkerLike | null
       info!.runningWorkers++
 
-      task(worker)
+      // A popped slot has to come back exactly once, however the task settles.
+      // Returning it only on success shrinks the pool for good: after
+      // `poolSize` failures the queue is empty, and from there every `addTask`
+      // takes the retry branch below and reschedules itself every 50ms with no
+      // slot left to claim — the next batch never runs.
+      let slotReturned = false
+      const returnSlot = (recycled: WorkerLike | null): void => {
+        if (slotReturned) return
+        slotReturned = true
+        this.workerQueue.push(recycled)
+      }
+
+      // A task that throws before returning its promise never reaches the
+      // handlers below, so the slot it was lent would stay popped. Worse, the
+      // retry branch calls `addTask` from a timer, where the throw has no
+      // caller to catch it: it escapes as an uncaught exception and the batch
+      // never settles. Normalised into a rejection, it takes the same path as
+      // a task that rejects.
+      let running: Promise<{ worker: WorkerLike; result: T }>
+      try {
+        running = Promise.resolve(task(worker))
+      } catch (error) {
+        running = Promise.reject(error)
+      }
+
+      running
         .then(({ worker: returnedWorker, result }) => {
-          this.workerQueue.push(returnedWorker)
+          returnSlot(returnedWorker)
 
           // Guard: the run may have been cleared while this task was in-flight.
-          if (this.runInfo[infoIndex] != null) {
+          // The slot above still has to come back — that is the pool's, not the
+          // run's — but everything below belongs to a run that has already
+          // settled, and writing to it would refill the bookkeeping `clearTask`
+          // just emptied. That memory is never reclaimed: `runInfo` entries are
+          // kept forever because their indices are run IDs, and a failed run
+          // never returns to `runningWorkers === 0` to be cleared a second time.
+          if (!info!.cleared) {
             info!.runningWorkers--
             info!.results[resultIndex] = result
             info!.completedTasks++
@@ -214,8 +247,26 @@ class WorkerPool {
           }
         })
         .catch((error: unknown) => {
+          // Two ways to land here: the task failed (rejected, or threw before
+          // returning above), or the handler above threw after it had already
+          // recycled the worker. `slotReturned` tells them apart — only the
+          // first leaves a worker unaccounted for.
+          const abandoned = slotReturned ? null : worker
+
+          // The lent worker is dropped rather than recycled: a failed task
+          // leaves it in an unknown state, and a NodeWorker whose thread died
+          // latches the error and replays it to every later request, so
+          // handing it to the next task would poison the slot. An empty slot
+          // takes its place and the next task creates a fresh worker.
+          returnSlot(null)
+
           info!.reject!(error)
           this.clearTask(info!.index)
+
+          // Nothing else holds a reference to the abandoned worker, so this is
+          // its only chance to be shut down — a leaked `node:worker_threads`
+          // thread keeps the whole process alive.
+          abandoned?.terminate()
         })
     } else {
       if (info!.runningWorkers !== 0 || info!.postponed) {
@@ -239,6 +290,7 @@ class WorkerPool {
    */
   private clearTask(clearIndex: number): void {
     const info = this.runInfo[clearIndex]
+    info.cleared = true
     info.results = []
     info.taskQueue = []
     info.progressCallback = null

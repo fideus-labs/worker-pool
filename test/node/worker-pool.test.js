@@ -42,6 +42,26 @@ function squareTask(value) {
   }
 }
 
+/** A stand-in worker that records how often it is terminated. */
+function stubWorker() {
+  return {
+    terminated: 0,
+    postMessage() {},
+    terminate() { this.terminated++ },
+    addEventListener() {},
+    removeEventListener() {},
+  }
+}
+
+/** Poll until `predicate` holds, failing the test after ~2s rather than hanging. */
+async function waitFor(predicate, message) {
+  for (let i = 0; i < 200; i++) {
+    if (predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  assert.fail(message)
+}
+
 test('createWorker builds a node:worker_threads worker when there is no global Worker', () => {
   assert.equal(typeof globalThis.Worker, 'undefined')
   assert.ok(isNodeRuntime())
@@ -110,6 +130,243 @@ test('a message accepts a transfer list', async () => {
     ])
     assert.deepEqual(await promise, [81])
   } finally {
+    pool.terminateWorkers()
+  }
+})
+
+test('a rejected task gives its slot back to the pool', async () => {
+  const pool = new WorkerPool(2)
+  try {
+    await assert.rejects(
+      pool.runTasks([async () => { throw new Error('boom') }]).promise,
+      /boom/,
+    )
+    assert.equal(pool.workerQueue.length, 2, 'the pool kept both slots')
+  } finally {
+    pool.terminateWorkers()
+  }
+})
+
+// The slot has to come back on the failure path too. When it does not, each
+// rejection shrinks the pool by one, and once every slot is gone the scheduler
+// has nothing left to hand out: this batch would never start, and the test
+// would fail on its timeout rather than on an assertion.
+test('a pool that has failed on every slot still runs the next batch', { timeout: 10_000 }, async () => {
+  const pool = new WorkerPool(2)
+  try {
+    for (let i = 0; i < 4; i++) {
+      await assert.rejects(
+        pool.runTasks([async () => { throw new Error(`boom ${i}`) }]).promise,
+        /boom/,
+      )
+    }
+    assert.equal(pool.workerQueue.length, 2)
+
+    const { promise } = pool.runTasks([squareTask(6), squareTask(7)])
+    assert.deepEqual(await promise, [36, 49])
+  } finally {
+    pool.terminateWorkers()
+  }
+})
+
+test('a rejected task terminates the worker it was lent instead of leaking it', async () => {
+  const pool = new WorkerPool(1)
+  const lent = stubWorker()
+
+  // Park the stub worker in the pool's only slot.
+  await pool.runTasks([async () => ({ worker: lent, result: 1 })]).promise
+  assert.equal(pool.workerQueue[0], lent)
+
+  // The next task is handed that worker and fails while holding it. Nothing
+  // else has a reference to it, so the pool is the only thing that can shut it
+  // down — a live worker thread keeps the Node process from exiting.
+  await assert.rejects(
+    pool.runTasks([async () => { throw new Error('boom') }]).promise,
+    /boom/,
+  )
+
+  assert.equal(lent.terminated, 1)
+  assert.equal(pool.workerQueue.length, 1)
+  assert.equal(pool.workerQueue[0], null, 'a failed worker is not handed to the next task')
+})
+
+// The rejection handler is chained after the fulfillment handler, so it also
+// runs when that handler throws — by which point the worker has already been
+// recycled. Treating that as a task failure would terminate a healthy worker
+// still sitting in the queue and push a second slot for the one task.
+test('a progress callback that throws does not cost the pool its worker', async () => {
+  const pool = new WorkerPool(1)
+  const lent = stubWorker()
+  const task = async () => ({ worker: lent, result: 1 })
+
+  await pool.runTasks([task]).promise
+  assert.equal(pool.workerQueue[0], lent)
+
+  const { promise } = pool.runTasks([task], () => {
+    throw new Error('callback boom')
+  })
+  await assert.rejects(promise, /callback boom/)
+
+  assert.equal(lent.terminated, 0, 'the recycled worker is still healthy')
+  assert.equal(pool.workerQueue.length, 1, 'the slot came back exactly once')
+  assert.equal(pool.workerQueue[0], lent, 'and it came back holding its worker')
+})
+
+// The first rejection settles the batch and tears the run down, so the second
+// lands on a run whose `reject` is already a no-op. Its slot and its worker are
+// still the pool's responsibility.
+test('every task in a batch can fail without leaking a slot or a worker', async () => {
+  const unhandled = []
+  const onUnhandled = (reason) => unhandled.push(reason)
+  process.on('unhandledRejection', onUnhandled)
+
+  const pool = new WorkerPool(2)
+  const lent = [stubWorker(), stubWorker()]
+  try {
+    // Park both stubs in the pool so the failing batch is handed real workers.
+    await pool.runTasks([
+      async () => ({ worker: lent[0], result: 0 }),
+      async () => ({ worker: lent[1], result: 1 }),
+    ]).promise
+    assert.equal(pool.workerQueue.length, 2)
+
+    await assert.rejects(
+      pool.runTasks([
+        async () => { throw new Error('boom 0') },
+        async () => { throw new Error('boom 1') },
+      ]).promise,
+      /boom/,
+    )
+
+    await waitFor(() => pool.workerQueue.length === 2, 'a failed task kept its slot')
+    assert.deepEqual(pool.workerQueue, [null, null])
+    assert.deepEqual(
+      lent.map((w) => w.terminated),
+      [1, 1],
+      'both lent workers were shut down, including the one whose run was already cleared',
+    )
+
+    // Let any stray rejection surface before asserting there was none.
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    assert.deepEqual(unhandled, [])
+
+    assert.deepEqual(await pool.runTasks([squareTask(4), squareTask(5)]).promise, [16, 25])
+  } finally {
+    process.off('unhandledRejection', onUnhandled)
+    pool.terminateWorkers()
+  }
+})
+
+test('a task that throws before returning a promise gives its slot back', async () => {
+  const pool = new WorkerPool(2)
+  try {
+    await assert.rejects(
+      pool.runTasks([() => { throw new Error('sync boom') }]).promise,
+      /sync boom/,
+    )
+    assert.equal(pool.workerQueue.length, 2, 'the pool kept both slots')
+
+    assert.deepEqual(await pool.runTasks([squareTask(3)]).promise, [9])
+  } finally {
+    pool.terminateWorkers()
+  }
+})
+
+// The retry branch calls the task from a `setTimeout` callback, where a
+// synchronous throw has no caller to catch it: it escapes as an uncaught
+// exception — fatal to the process — and the batch promise never settles.
+test('a synchronous throw from the retry branch does not escape the pool', { timeout: 10_000 }, async () => {
+  const pool = new WorkerPool(1)
+  const stub = stubWorker()
+
+  // Batch 1 takes the pool's only slot and holds it.
+  const first = pool.runTasks([
+    async () => {
+      await new Promise((resolve) => setTimeout(resolve, 150))
+      return { worker: stub, result: 1 }
+    },
+  ]).promise
+
+  // Batch 2 finds no free slot and nothing of its own running, so it postpones
+  // and retries on a timer. A retry lands after batch 1 frees the slot, and
+  // runs the throwing task from inside that timer.
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  const second = pool.runTasks([() => { throw new Error('sync boom from timer') }]).promise
+
+  await assert.rejects(second, /sync boom from timer/)
+  assert.deepEqual(await first, [1])
+  assert.equal(pool.workerQueue.length, 1, 'the retried slot came back')
+})
+
+test('a task still in flight when its batch fails gives its slot back too', async () => {
+  const pool = new WorkerPool(2)
+  try {
+    let release
+    const held = new Promise((resolve) => { release = resolve })
+
+    const { promise } = pool.runTasks([
+      async () => { throw new Error('boom') },
+      async (slot) => {
+        const worker = slot ?? createWorker(SQUARE_WORKER)
+        await held
+        const { result } = await request(worker, { value: 5 })
+        return { worker, result }
+      },
+    ])
+
+    await assert.rejects(promise, /boom/)
+    // The batch has already rejected while the second task holds a slot.
+    assert.equal(pool.workerQueue.length, 1)
+
+    // That straggler settles into a run that is already torn down. Its slot
+    // still has to come back, or the pool ends the batch a worker short.
+    release()
+    await waitFor(
+      () => pool.workerQueue.length === 2,
+      'the in-flight task never returned its slot',
+    )
+
+    assert.deepEqual(await pool.runTasks([squareTask(6), squareTask(7)]).promise, [36, 49])
+  } finally {
+    pool.terminateWorkers()
+  }
+})
+
+// `clearTask` empties a settled run's bookkeeping but leaves its entry in
+// `runInfo`, because indices are run IDs. A straggler that writes its result in
+// afterwards refills what was just emptied, and nothing ever empties it again:
+// a failed run never comes back to `runningWorkers === 0`, so its second
+// `clearTask` never runs and the result is retained for the pool's lifetime.
+test('a straggler does not refill the bookkeeping of a run that already settled', async () => {
+  const pool = new WorkerPool(2)
+  const settled = []
+  try {
+    let release
+    const held = new Promise((resolve) => { release = resolve })
+
+    const { promise, runId } = pool.runTasks([
+      async () => { throw new Error('boom') },
+      async () => {
+        await held
+        return { worker: stubWorker(), result: 'straggler' }
+      },
+    ])
+    await assert.rejects(promise, /boom/)
+
+    // Reach into the pool's own bookkeeping: this is about state the caller
+    // cannot see, so there is nothing else to assert against.
+    const info = pool.runInfo[runId]
+    assert.deepEqual(info.results, [], 'the run was torn down')
+
+    release()
+    await waitFor(() => pool.workerQueue.length === 2, 'the straggler kept its slot')
+    settled.push('straggler done')
+
+    assert.deepEqual(info.results, [], 'the straggler left the cleared run alone')
+    assert.equal(info.completedTasks, 0)
+    assert.equal(info.progressCallback, null)
+  } finally {
+    assert.deepEqual(settled, ['straggler done'])
     pool.terminateWorkers()
   }
 })
