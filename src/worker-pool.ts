@@ -106,6 +106,7 @@ class WorkerPool {
       completedTasks: 0,
       progressCallback,
       canceled: false,
+      cleared: false,
     }
     this.runInfo.push(info as RunInfo<unknown>)
     info.index = this.runInfo.length - 1
@@ -220,7 +221,13 @@ class WorkerPool {
           returnSlot(returnedWorker)
 
           // Guard: the run may have been cleared while this task was in-flight.
-          if (this.runInfo[infoIndex] != null) {
+          // The slot above still has to come back — that is the pool's, not the
+          // run's — but everything below belongs to a run that has already
+          // settled, and writing to it would refill the bookkeeping `clearTask`
+          // just emptied. That memory is never reclaimed: `runInfo` entries are
+          // kept forever because their indices are run IDs, and a failed run
+          // never returns to `runningWorkers === 0` to be cleared a second time.
+          if (!info!.cleared) {
             info!.runningWorkers--
             info!.results[resultIndex] = result
             info!.completedTasks++
@@ -283,6 +290,7 @@ class WorkerPool {
    */
   private clearTask(clearIndex: number): void {
     const info = this.runInfo[clearIndex]
+    info.cleared = true
     info.results = []
     info.taskQueue = []
     info.progressCallback = null

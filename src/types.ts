@@ -72,6 +72,14 @@ export interface RunInfo<T> {
   completedTasks: number
   progressCallback: WorkerPoolProgressCallback | null
   canceled: boolean | null
+  /**
+   * Set once the run has settled and its bookkeeping has been torn down.
+   *
+   * The run's entry stays in `runInfo` — indices are run IDs — so there is no
+   * null to test for. A task still in flight when the run ends checks this
+   * before touching any of it.
+   */
+  cleared: boolean
   resolve?: (results: T[]) => void
   reject?: (error: unknown) => void
 }

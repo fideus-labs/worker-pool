@@ -332,6 +332,45 @@ test('a task still in flight when its batch fails gives its slot back too', asyn
   }
 })
 
+// `clearTask` empties a settled run's bookkeeping but leaves its entry in
+// `runInfo`, because indices are run IDs. A straggler that writes its result in
+// afterwards refills what was just emptied, and nothing ever empties it again:
+// a failed run never comes back to `runningWorkers === 0`, so its second
+// `clearTask` never runs and the result is retained for the pool's lifetime.
+test('a straggler does not refill the bookkeeping of a run that already settled', async () => {
+  const pool = new WorkerPool(2)
+  const settled = []
+  try {
+    let release
+    const held = new Promise((resolve) => { release = resolve })
+
+    const { promise, runId } = pool.runTasks([
+      async () => { throw new Error('boom') },
+      async () => {
+        await held
+        return { worker: stubWorker(), result: 'straggler' }
+      },
+    ])
+    await assert.rejects(promise, /boom/)
+
+    // Reach into the pool's own bookkeeping: this is about state the caller
+    // cannot see, so there is nothing else to assert against.
+    const info = pool.runInfo[runId]
+    assert.deepEqual(info.results, [], 'the run was torn down')
+
+    release()
+    await waitFor(() => pool.workerQueue.length === 2, 'the straggler kept its slot')
+    settled.push('straggler done')
+
+    assert.deepEqual(info.results, [], 'the straggler left the cleared run alone')
+    assert.equal(info.completedTasks, 0)
+    assert.equal(info.progressCallback, null)
+  } finally {
+    assert.deepEqual(settled, ['straggler done'])
+    pool.terminateWorkers()
+  }
+})
+
 test('an error thrown inside the worker rejects the request', { timeout: 10_000 }, async () => {
   const worker = createWorker(SQUARE_WORKER)
   try {
