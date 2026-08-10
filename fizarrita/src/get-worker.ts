@@ -72,6 +72,52 @@ export function createCacheKey<D extends DataType, Store extends Readable>(
   return `${storeId}:${arr.path}:${chunkKey}`
 }
 
+/**
+ * Chunk fetch+decode operations currently in flight, keyed exactly like the
+ * cache, so that concurrent readers of the same chunk share one of each.
+ *
+ * A cache alone cannot do this: `ChunkCache` is synchronous and holds decoded
+ * chunks, so nothing lands in it until a decode has already finished. Two
+ * `getWorker` calls that overlap — two viewports, a re-render arriving mid-flight
+ * — therefore both miss, both fetch, and both decode the very same bytes. This
+ * map is what closes the window between "someone started fetching this" and
+ * "the result is cacheable".
+ */
+const pendingChunks = new Map<string, Promise<Chunk<DataType>>>()
+
+/**
+ * Run `produce` once per key, handing concurrent callers the same promise.
+ *
+ * The entry is removed as soon as it settles, on both paths: keeping a rejection
+ * would make one transient fetch failure permanent for that chunk, and keeping a
+ * fulfilment would duplicate the cache while pinning chunks the cache has since
+ * evicted. Removal is conditional on the entry still being ours so a later
+ * attempt that already replaced it is not dropped by our own settlement.
+ */
+function shareInFlightChunk<D extends DataType>(
+  key: string,
+  produce: () => Promise<Chunk<D>>,
+): Promise<Chunk<D>> {
+  const inFlight = pendingChunks.get(key)
+  if (inFlight) {
+    return inFlight as Promise<Chunk<D>>
+  }
+
+  const promise = produce()
+  pendingChunks.set(key, promise as unknown as Promise<Chunk<DataType>>)
+
+  const forget = () => {
+    if (pendingChunks.get(key) === (promise as unknown)) {
+      pendingChunks.delete(key)
+    }
+  }
+  // Both handlers swallow: this branch exists only to clean up, and the caller
+  // still receives `promise` itself and still sees the rejection.
+  promise.then(forget, forget)
+
+  return promise
+}
+
 // ---------------------------------------------------------------------------
 // Unified metadata reader — reads zarr.json once, returns everything needed
 // ---------------------------------------------------------------------------
@@ -770,92 +816,110 @@ export async function getWorker<
       continue
     }
 
+    /** The zero/fill-value chunk used when the store has no bytes for this key. */
+    const buildFillChunk = (): Chunk<D> => {
+      const fillChunkShape = edgeChunkShape
+      const fillChunkStrides = get_strides(fillChunkShape)
+      const fillChunkSize = fillChunkShape.reduce(
+        (a: number, b: number) => a * b,
+        1,
+      )
+      const chunkData = new Ctr(fillChunkSize)
+      if (fillValue != null) {
+        // @ts-expect-error: fill_value type is union
+        chunkData.fill(fillValue)
+      }
+      return {
+        data: chunkData as Chunk<D>["data"],
+        shape: fillChunkShape,
+        stride: fillChunkStrides,
+      }
+    }
+
     tasks.push(async (workerSlot: WorkerLike | null) => {
       const worker = workerSlot ?? createCodecWorker(workerUrl)
 
-      // Fetch raw bytes from store on main thread
-      const rawBytes = await arr.store.get(chunkPath, opts.opts)
-
-      if (!rawBytes) {
-        // Missing chunk — fill value, no worker needed
-        const fillChunkShape = edgeChunkShape
-        const fillChunkStrides = get_strides(fillChunkShape)
-        const fillChunkSize = fillChunkShape.reduce(
-          (a: number, b: number) => a * b,
-          1,
-        )
-        const chunkData = new Ctr(fillChunkSize)
-        if (fillValue != null) {
-          // @ts-expect-error: fill_value type is union
-          chunkData.fill(fillValue)
+      // SAB path (no cache): the worker decodes AND writes directly into *this*
+      // call's SharedArrayBuffer, using *this* call's mapping — no transfer
+      // back, no main-thread copy. There is no standalone chunk here to hand to
+      // anyone else, so this path cannot participate in sharing and is left
+      // exactly as it was.
+      if (useShared && !opts.cache) {
+        const rawBytes = await arr.store.get(chunkPath, opts.opts)
+        if (!rawBytes) {
+          setter.set_from_chunk(out, buildFillChunk(), mapping)
+        } else {
+          try {
+            await workerDecodeInto(
+              worker,
+              rawBytes,
+              metaId,
+              correctedCodecMeta,
+              buffer as SharedArrayBuffer,
+              size * bytesPerElement,
+              outStride,
+              mapping,
+              bytesPerElement,
+              isEdgeChunk ? edgeChunkShape : undefined,
+            )
+          } catch (error) {
+            worker.terminate()
+            throw error
+          }
         }
-        const chunk: Chunk<D> = {
-          data: chunkData as Chunk<D>["data"],
-          shape: fillChunkShape,
-          stride: fillChunkStrides,
-        }
-        // Cache the fill-value chunk
-        cache.set(cacheKey, chunk)
-        // Copy fill-value chunk into output on main thread
-        setter.set_from_chunk(out, chunk, mapping)
-      } else if (useShared && !opts.cache) {
-        // SAB path (no cache): worker decodes AND writes directly into the
-        // SharedArrayBuffer output — no transfer back, no main-thread copy.
-        try {
-          await workerDecodeInto(
-            worker,
-            rawBytes,
-            metaId,
-            correctedCodecMeta,
-            buffer as SharedArrayBuffer,
-            size * bytesPerElement,
-            outStride,
-            mapping,
-            bytesPerElement,
-            isEdgeChunk ? edgeChunkShape : undefined,
-          )
-        } catch (error) {
-          worker.terminate()
-          throw error
-        }
-      } else if (useShared && opts.cache) {
-        // SAB path with cache: use workerDecode to get a standalone chunk
-        // so we can cache it, then copy into the SAB output. The small
-        // overhead of transfer + copy on first access is repaid by
-        // subsequent cache hits that skip the worker entirely.
-        let chunk: Chunk<D>
-        try {
-          chunk = await workerDecode<D>(
-            worker,
-            rawBytes,
-            metaId,
-            correctedCodecMeta,
-            isEdgeChunk ? edgeChunkShape : undefined,
-          )
-        } catch (error) {
-          worker.terminate()
-          throw error
-        }
-        cache.set(cacheKey, chunk)
-        setter.set_from_chunk(out, chunk, mapping)
-      } else {
-        // Standard path: worker decodes, transfers back, main thread copies
-        let chunk: Chunk<D>
-        try {
-          chunk = await workerDecode<D>(
-            worker,
-            rawBytes,
-            metaId,
-            correctedCodecMeta,
-            isEdgeChunk ? edgeChunkShape : undefined,
-          )
-        } catch (error) {
-          worker.terminate()
-          throw error
-        }
-        cache.set(cacheKey, chunk)
-        setter.set_from_chunk(out, chunk, mapping)
+        return { worker, result: undefined as void }
       }
+
+      // The cache is consulted again here, not just when the task list was
+      // built: between those two moments another task — very likely a
+      // concurrent `getWorker` — may have finished this exact chunk.
+      const cachedSinceBuild = cache.get(cacheKey)
+      if (cachedSinceBuild) {
+        setter.set_from_chunk(out, cachedSinceBuild as Chunk<D>, mapping)
+        return { worker, result: undefined as void }
+      }
+
+      // One fetch and one decode per chunk, however many callers want it. The
+      // follower still holds its worker slot while waiting, which costs some
+      // parallelism — but that slot would otherwise have been spent on a
+      // duplicate network round-trip and a duplicate decompression of bytes
+      // already in flight, so it is not work being given up.
+      const chunk = await shareInFlightChunk<D>(cacheKey, async () => {
+        const rawBytes = await arr.store.get(chunkPath, opts.opts)
+        if (!rawBytes) {
+          return buildFillChunk()
+        }
+        try {
+          return await workerDecode<D>(
+            worker,
+            rawBytes,
+            metaId,
+            correctedCodecMeta,
+            isEdgeChunk ? edgeChunkShape : undefined,
+          )
+        } catch (error) {
+          worker.terminate()
+          throw error
+        }
+      })
+
+      // Populate *this* read's cache, whoever produced the chunk. Sharing is
+      // keyed on the chunk, not on the cache, so the producer may have been a
+      // concurrent read holding a different cache instance — or none at all.
+      // Leaving the write to the producer would mean a caller that supplied a
+      // cache silently not getting it filled, which is the `cache` contract
+      // ("on a cache miss the decoded chunk is stored for future use") quietly
+      // not holding.
+      //
+      // Guarded rather than unconditional so no cache is handed an entry it
+      // already holds: with a shared chunk that write is not merely redundant,
+      // it displaces a live entry with itself, which a cache that disposes on
+      // overwrite would act on.
+      if (!cache.get(cacheKey)) {
+        cache.set(cacheKey, chunk)
+      }
+
+      setter.set_from_chunk(out, chunk, mapping)
 
       return { worker, result: undefined as void }
     })
