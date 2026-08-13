@@ -568,6 +568,39 @@ test('concurrent reads on a cold array share one metadata read and one probe', a
   })
 })
 
+test('store options reach the metadata reads, not just the probe', async () => {
+  const store = new CountingStore()
+  const arr = await zarr.create(zarr.root(store).resolve('/data'), {
+    shape: [8, 8],
+    chunk_shape: [4, 4],
+    data_type: 'int32',
+  })
+  await zarr.set(arr, null, {
+    data: Int32Array.from({ length: 64 }, (_, i) => i),
+    shape: [8, 8],
+    stride: [8, 1],
+  })
+
+  // Record the options every read is given, keyed by path.
+  const seenOpts = new Map()
+  const realGet = CountingStore.prototype.get.bind(store)
+  store.get = (key, opts) => {
+    seenOpts.set(key, opts)
+    return realGet(key)
+  }
+
+  const marker = { headers: { authorization: 'sentinel' } }
+  await withPool(2, async (pool) => {
+    await getWorker(arr, null, { pool, opts: marker })
+  })
+
+  // The metadata read used to be the one store request that silently dropped
+  // the caller's options while the probe and chunk fetches honoured them.
+  assert.equal(seenOpts.get('/data/zarr.json'), marker)
+  assert.equal(seenOpts.get('/data/c/0/0'), marker)
+  assert.equal(seenOpts.get('/data/c/1/1'), marker)
+})
+
 test('a failed metadata read is retried, not memoised', async () => {
   const { store, arr } = await makeCountedArray()
 

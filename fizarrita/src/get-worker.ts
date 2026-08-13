@@ -151,6 +151,15 @@ export interface ArrayMetadata {
   fillValue: Scalar<DataType> | null
 }
 
+/**
+ * Read a zarr array's metadata, trying v3 (`zarr.json`) then v2 (`.zarray`).
+ *
+ * `storeOpts` is forwarded to every `store.get` this makes, so an AbortSignal,
+ * auth header, or any other per-request option governs the metadata reads on
+ * the same terms as the chunk reads that follow them — a signal that aborts
+ * the chunk fetches but silently leaves the `zarr.json` read running would be
+ * a surprising asymmetry.
+ */
 export async function readArrayMetadata<
   D extends DataType,
   Store extends Readable,
@@ -765,9 +774,13 @@ const resolvedArrayInfo = new WeakMap<
  * correction, so it describes the chunks as stored, not as the metadata
  * claimed.
  *
- * `storeOpts` only reaches the store on the call that performs the resolution;
- * memoised results are shared across callers regardless of their options. A
- * rejected resolution is evicted so a transient store failure is retried by
+ * `storeOpts` is forwarded to every store read the resolution makes — both the
+ * metadata reads and the shape probe — but only on the call that actually
+ * performs it: a later caller hitting the memoised promise contributes no
+ * store request for its own options to govern. An AbortSignal therefore aborts
+ * the resolution it started, not one already in flight for someone else.
+ *
+ * A rejected resolution is evicted so a transient store failure is retried by
  * the next call instead of becoming permanent.
  */
 export function resolveArrayInfo<D extends DataType, Store extends Readable>(
@@ -783,7 +796,10 @@ export function resolveArrayInfo<D extends DataType, Store extends Readable>(
   if (memoised) return memoised
 
   const promise = (async (): Promise<ArrayMetadata> => {
-    const { codecMeta, encodeChunkKey, fillValue } = await readArrayMetadata(arr)
+    const { codecMeta, encodeChunkKey, fillValue } = await readArrayMetadata(
+      arr,
+      storeOpts,
+    )
     const Ctr = get_ctr(arr.dtype)
     const bytesPerElement = (Ctr as unknown as { BYTES_PER_ELEMENT: number })
       .BYTES_PER_ELEMENT
