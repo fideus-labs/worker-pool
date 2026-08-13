@@ -780,7 +780,12 @@ export async function getWorker<
   const useShared = !!opts.useSharedArrayBuffer
   const cache = opts.cache ?? NULL_CACHE
 
-  signal?.throwIfAborted()
+  // Not `throwIfAborted()`: some runtimes grew `AbortSignal` before that
+  // method, and on them the call itself would throw a TypeError on every
+  // signalled read, aborted or not.
+  if (signal?.aborted) {
+    throw signal.reason
+  }
 
   // The signal actually handed to `store.get`: the caller may already carry a
   // store-level signal inside `opts.opts`, and folding ours in must not
@@ -817,14 +822,19 @@ export async function getWorker<
     codecMeta,
     bytesPerElement,
     storeOpts,
-    signal,
+    // The probe's fetches run under the combined signal, so its abort
+    // detection has to watch the same one — with only `signal`, a store-level
+    // abort would be swallowed by the probe's catch-alls.
+    fetchSignal,
   )
 
   // Checkpoint for stores that ignore the signal: their metadata and probe
   // reads complete instead of rejecting, and this is the last await before
   // the pool (whose own signal handling covers the rest) — without it, a
   // fully-cached read would return data after its caller already walked away.
-  signal?.throwIfAborted()
+  if (signal?.aborted) {
+    throw signal.reason
+  }
 
   // Update codecMeta to use the actual chunk shape for codec pipeline
   const correctedCodecMeta =
