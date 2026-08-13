@@ -584,8 +584,10 @@ export function inferChunkShape(
  * candidate's chunks are too large (the real grid has more chunks in that
  * dimension) and should be rejected.
  *
- * Returns true if the candidate is valid (probe returned 404/empty),
- * false if invalid (probe returned data, meaning chunks are too coarse).
+ * `valid` is true if the candidate holds (probe returned 404/empty), false if
+ * invalid (probe returned data, meaning chunks are too coarse). `conclusive`
+ * is false when the answer came from a swallowed fetch error rather than from
+ * a completed probe — see {@link ChunkShapeProbe}.
  */
 async function validateCandidateChunkShape<
   D extends DataType,
@@ -596,7 +598,7 @@ async function validateCandidateChunkShape<
   candidate: number[],
   storeOpts?: Parameters<Store["get"]>[1],
   signal?: AbortSignal,
-): Promise<boolean> {
+): Promise<{ valid: boolean; conclusive: boolean }> {
   const ndim = candidate.length
 
   // Compute grid dimensions and find the dimension with the smallest extent > 1
@@ -616,8 +618,10 @@ async function validateCandidateChunkShape<
   }
 
   if (probeDim === -1) {
-    // All dimensions have only 1 chunk — can't validate, assume correct
-    return true
+    // All dimensions have only 1 chunk — can't validate, assume correct.
+    // Conclusive: this answer is a property of the grid, not of a failed
+    // request, so it will be the same on every retry.
+    return { valid: true, conclusive: true }
   }
 
   // Probe one-past-the-end: if the store has a chunk at this coordinate,
@@ -630,12 +634,14 @@ async function validateCandidateChunkShape<
   try {
     const probeBytes = await arr.store.get(probePath, storeOpts)
     // If data returned, there's a chunk beyond our expected grid → reject
-    return !probeBytes
+    return { valid: !probeBytes, conclusive: true }
   } catch (error) {
     // A caller abort is not a probe outcome — the whole read is over.
     if (signal?.aborted) throw error
-    // Fetch error (404, network error) → no chunk there → accept
-    return true
+    // Fetch error (404, network error) → no chunk there → accept. The two are
+    // indistinguishable here, so the acceptance is a guess made under an
+    // error and must not be memoised as settled.
+    return { valid: true, conclusive: false }
   }
 }
 
@@ -667,6 +673,52 @@ export async function probeActualChunkShape<
   storeOpts?: Parameters<Store["get"]>[1],
   signal?: AbortSignal,
 ): Promise<number[]> {
+  const { shape } = await probeChunkShape(
+    arr,
+    encodeChunkKey,
+    codecMeta,
+    bytesPerElement,
+    storeOpts,
+    signal,
+  )
+  return shape
+}
+
+/**
+ * A probed chunk shape, plus whether the probe actually concluded it.
+ *
+ * `conclusive` is false when the shape is what the probe fell back to after
+ * swallowing a store failure — a fetch that threw — rather than what it read
+ * from the data. (An abort of the `signal` the probe was given to watch is not
+ * swallowed at all: it propagates and ends the read.)
+ *
+ * The distinction exists because {@link resolveArrayInfo} memoises the result.
+ * Swallowing the failure is right for a single read: the probe is a heuristic
+ * correction, and failing a whole read because a *heuristic* could not fetch
+ * `c/0/0` would break reads of arrays whose first chunk merely happens to be
+ * unreachable. But an inconclusive answer must not outlive the call that made
+ * it. Before memoisation each read re-probed, so a transient blip cost one
+ * uncorrected read and healed itself; cached forever, that same blip leaves a
+ * mis-declared array decoding at the wrong shape for the lifetime of the
+ * store. So the fallback still returns — and is then refused a cache entry.
+ */
+interface ChunkShapeProbe {
+  shape: number[]
+  conclusive: boolean
+}
+
+/**
+ * {@link probeActualChunkShape}, reporting whether the answer was concluded
+ * from data or fallen back to after a store failure.
+ */
+async function probeChunkShape<D extends DataType, Store extends Readable>(
+  arr: ZarrArray<D, Store>,
+  encodeChunkKey: (chunk_coords: number[]) => string,
+  codecMeta: CodecChunkMeta,
+  bytesPerElement: number,
+  storeOpts?: Parameters<Store["get"]>[1],
+  signal?: AbortSignal,
+): Promise<ChunkShapeProbe> {
   const metadataChunkShape = codecMeta.chunk_shape
   const metaElements = metadataChunkShape.reduce((a, b) => a * b, 1)
 
@@ -675,9 +727,11 @@ export async function probeActualChunkShape<
   const chunkKey = encodeChunkKey(zeroCoords)
   const chunkPath = arr.resolve(chunkKey).path
 
+  // Every early return below is conclusive: each is a determination made from
+  // bytes actually read, so re-probing would reach the same answer.
   try {
     const rawBytes = await arr.store.get(chunkPath, storeOpts)
-    if (!rawBytes) return metadataChunkShape
+    if (!rawBytes) return { shape: metadataChunkShape, conclusive: true }
 
     // Determine decompressed size via hybrid strategy
     const decompressedBytes = await probeDecompressedSize(
@@ -685,10 +739,14 @@ export async function probeActualChunkShape<
       codecMeta,
       bytesPerElement,
     )
-    if (decompressedBytes == null) return metadataChunkShape
+    if (decompressedBytes == null) {
+      return { shape: metadataChunkShape, conclusive: true }
+    }
 
     const actualElements = decompressedBytes / bytesPerElement
-    if (actualElements === metaElements) return metadataChunkShape
+    if (actualElements === metaElements) {
+      return { shape: metadataChunkShape, conclusive: true }
+    }
 
     // Mismatch detected — infer chunk shape from element count + heuristics
     const candidates = inferChunkShape(
@@ -696,28 +754,35 @@ export async function probeActualChunkShape<
       metadataChunkShape,
       arr.shape,
     )
-    if (candidates.length === 0) return metadataChunkShape
+    if (candidates.length === 0) {
+      return { shape: metadataChunkShape, conclusive: true }
+    }
 
     // Validate candidates by probing one-past-the-end.
     // The first candidate that passes validation wins.
     // Limit validation attempts to avoid excessive network requests.
+    // A candidate accepted because its validation probe *failed* rather than
+    // came back empty taints the result: the choice was a guess, so it is
+    // returned but not treated as settled.
+    let conclusive = true
     const maxValidationAttempts = Math.min(candidates.length, 5)
     for (let i = 0; i < maxValidationAttempts; i++) {
       const candidate = candidates[i]
-      const isValid = await validateCandidateChunkShape(
+      const validation = await validateCandidateChunkShape(
         arr,
         encodeChunkKey,
         candidate,
         storeOpts,
         signal,
       )
-      if (isValid) {
+      if (!validation.conclusive) conclusive = false
+      if (validation.valid) {
         console.warn(
           `[fizarrita] Metadata chunk_shape ${JSON.stringify(metadataChunkShape)} ` +
             `does not match actual chunk data (${actualElements} elements). ` +
             `Using inferred chunk_shape: ${JSON.stringify(candidate)}`,
         )
-        return candidate
+        return { shape: candidate, conclusive }
       }
     }
 
@@ -728,12 +793,13 @@ export async function probeActualChunkShape<
         `does not match actual chunk data (${actualElements} elements). ` +
         `Using inferred chunk_shape: ${JSON.stringify(fallback)} (unvalidated)`,
     )
-    return fallback
+    return { shape: fallback, conclusive }
   } catch (error) {
     // The catch-all exists to degrade gracefully when the probe fetch fails;
     // a caller abort is not that — it has to stop the whole read.
     if (signal?.aborted) throw error
-    return metadataChunkShape
+    // A store failure, not a determination — see ChunkShapeProbe.
+    return { shape: metadataChunkShape, conclusive: false }
   }
 }
 
@@ -762,7 +828,7 @@ export async function probeActualChunkShape<
  */
 const resolvedArrayInfo = new WeakMap<
   object,
-  Map<string, Promise<ArrayMetadata>>
+  Map<string, Promise<{ info: ArrayMetadata; conclusive: boolean }>>
 >()
 
 /**
@@ -780,8 +846,14 @@ const resolvedArrayInfo = new WeakMap<
  * store request for its own options to govern. An AbortSignal therefore aborts
  * the resolution it started, not one already in flight for someone else.
  *
- * A rejected resolution is evicted so a transient store failure is retried by
- * the next call instead of becoming permanent.
+ * Two outcomes are deliberately *not* kept. A rejected resolution is evicted,
+ * so a transient store failure is retried by the next call instead of becoming
+ * permanent. So is a resolution whose chunk-shape probe was inconclusive — one
+ * that swallowed a store failure and fell back to the declared shape rather
+ * than reading the real one (see {@link ChunkShapeProbe}). Both still serve the
+ * call that produced them, and every caller already waiting on them; they just
+ * do not outlive it. Caching a guess made under an error is how a one-off blip
+ * would otherwise turn into an array that decodes at the wrong shape forever.
  */
 export function resolveArrayInfo<D extends DataType, Store extends Readable>(
   arr: ZarrArray<D, Store>,
@@ -793,9 +865,9 @@ export function resolveArrayInfo<D extends DataType, Store extends Readable>(
     resolvedArrayInfo.set(arr.store, infoByPath)
   }
   const memoised = infoByPath.get(arr.path)
-  if (memoised) return memoised
+  if (memoised) return memoised.then(({ info }) => info)
 
-  const promise = (async (): Promise<ArrayMetadata> => {
+  const promise = (async () => {
     const { codecMeta, encodeChunkKey, fillValue } = await readArrayMetadata(
       arr,
       storeOpts,
@@ -807,7 +879,7 @@ export function resolveArrayInfo<D extends DataType, Store extends Readable>(
     // to watch the same signal — otherwise its catch-alls would swallow an
     // abort as a store failure and hand back the fallback shape.
     const signal = (storeOpts as { signal?: AbortSignal } | undefined)?.signal
-    const chunkShape = await probeActualChunkShape(
+    const { shape, conclusive } = await probeChunkShape(
       arr,
       encodeChunkKey,
       codecMeta,
@@ -816,23 +888,32 @@ export function resolveArrayInfo<D extends DataType, Store extends Readable>(
       signal,
     )
     return {
-      codecMeta:
-        chunkShape !== codecMeta.chunk_shape
-          ? { ...codecMeta, chunk_shape: chunkShape }
-          : codecMeta,
-      encodeChunkKey,
-      fillValue,
+      info: {
+        codecMeta:
+          shape !== codecMeta.chunk_shape
+            ? { ...codecMeta, chunk_shape: shape }
+            : codecMeta,
+        encodeChunkKey,
+        fillValue,
+      },
+      conclusive,
     }
   })()
 
   const paths = infoByPath
   paths.set(arr.path, promise)
-  promise.catch(() => {
+  // Conditional on the entry still being ours, so a later attempt that already
+  // replaced it is not dropped by our own settlement.
+  const forget = () => {
     if (paths.get(arr.path) === promise) {
       paths.delete(arr.path)
     }
-  })
-  return promise
+  }
+  promise.then(({ conclusive }) => {
+    if (!conclusive) forget()
+  }, forget)
+
+  return promise.then(({ info }) => info)
 }
 
 // ---------------------------------------------------------------------------

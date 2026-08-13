@@ -601,6 +601,54 @@ test('store options reach the metadata reads, not just the probe', async () => {
   assert.equal(seenOpts.get('/data/c/1/1'), marker)
 })
 
+test('a probe that fails transiently is retried, not memoised as a missed correction', async () => {
+  const store = new CountingStore()
+  // Chunks are really 4x8. The metadata is rewritten below to claim 4x4, so
+  // the shape probe has real work to do — exactly the case where silently
+  // memoising "no correction needed" would corrupt every later read.
+  const arr = await zarr.create(zarr.root(store).resolve('/data'), {
+    shape: [8, 8],
+    chunk_shape: [4, 8],
+    data_type: 'int32',
+  })
+  const expected = Int32Array.from({ length: 64 }, (_, i) => i)
+  await zarr.set(arr, null, { data: expected, shape: [8, 8], stride: [8, 1] })
+
+  const meta = JSON.parse(new TextDecoder().decode(store.get('/data/zarr.json')))
+  meta.chunk_grid.configuration.chunk_shape = [4, 4]
+  store.set(
+    '/data/zarr.json',
+    new TextEncoder().encode(JSON.stringify(meta)),
+  )
+  const misdeclared = await zarr.open(zarr.root(store).resolve('/data'), {
+    kind: 'array',
+  })
+
+  // Fail the probe's chunk fetch exactly once. The metadata read must still
+  // succeed, or the resolution would reject and be evicted by the other path.
+  let probeFailures = 1
+  const realGet = CountingStore.prototype.get.bind(store)
+  store.get = (key) => {
+    if (key.includes('/c/') && probeFailures > 0) {
+      probeFailures--
+      throw new Error('transient probe failure')
+    }
+    return realGet(key)
+  }
+
+  await withPool(2, async (pool) => {
+    // The first read loses the probe and falls back to the declared 4x4.
+    // Whether it then throws or returns misshapen data is not the point —
+    // what matters is that the miss is not remembered.
+    await getWorker(misdeclared, null, { pool }).catch(() => {})
+
+    // The second read probes again and finds the real 4x8 chunking.
+    const result = await getWorker(misdeclared, null, { pool })
+    assert.deepEqual(result.shape, [8, 8])
+    assert.deepEqual(Array.from(result.data), Array.from(expected))
+  })
+})
+
 test('a failed metadata read is retried, not memoised', async () => {
   const { store, arr } = await makeCountedArray()
 
