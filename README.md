@@ -7,6 +7,8 @@ A worker pool with bounded concurrency, plus a companion
 zarrita codec operations on workers. Runs on Web Workers in the browser and on
 `node:worker_threads` in Node, behind one interface.
 
+[![Watch the presentation](https://img.youtube.com/vi/D5NnpXxyJa8/maxresdefault.jpg)](https://www.youtube.com/watch?v=D5NnpXxyJa8)
+
 ## Features
 
 - **Bounded concurrency** — at most `poolSize` workers run simultaneously.
