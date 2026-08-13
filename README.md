@@ -121,6 +121,20 @@ try {
 }
 ```
 
+A batch can also be tied to an `AbortSignal`. When the signal fires, tasks
+that have not started are dropped and the promise rejects with the signal's
+reason; tasks already running finish, but their results are discarded and
+their workers return to the pool:
+
+```typescript
+const controller = new AbortController()
+
+const { promise } = pool.runTasks(tasks, null, { signal: controller.signal })
+
+// e.g. the viewport moved and these results are stale:
+controller.abort(new Error('viewport moved'))
+```
+
 ## API
 
 ### `new WorkerPool(poolSize: number)`
@@ -136,12 +150,15 @@ Enqueue a task. Tasks are started when `onIdle()` is called.
 Execute all enqueued tasks and wait for completion. Returns results in the
 order tasks were added.
 
-### `pool.runTasks<T>(taskFns, progressCallback?): { promise, runId }`
+### `pool.runTasks<T>(taskFns, progressCallback?, options?): { promise, runId }`
 
 Submit a batch of tasks. The `promise` resolves with ordered results. The
 optional `progressCallback` is invoked as
 `(completedTasks: number, totalTasks: number) => void` after each task
-completes.
+completes. `options.signal` accepts an `AbortSignal`: when it fires, tasks
+that have not started are dropped and the promise rejects with the signal's
+reason. A signal that is already aborted rejects the batch before any task
+starts.
 
 ### `pool.cancel(runId: number): void`
 
