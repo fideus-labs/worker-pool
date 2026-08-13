@@ -729,6 +729,97 @@ export async function probeActualChunkShape<
 }
 
 // ---------------------------------------------------------------------------
+// Per-array resolution — metadata read + chunk-shape probe, memoised
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolved array info per store, keyed by array path.
+ *
+ * Both the array metadata and the probed chunk shape are immutable for the
+ * lifetime of an array, but resolving them costs store round-trips: one read
+ * of `zarr.json` (two, when falling back to v2), one chunk read for the probe,
+ * and up to five one-past-the-end probes on a mismatch. Without memoisation
+ * every `getWorker` call pays them *before* the chunk cache is consulted, so a
+ * fully populated cache cannot eliminate them — for a tiled viewer that is
+ * per-tile overhead scaling with pan/zoom activity rather than with cache
+ * misses.
+ *
+ * Keyed on the store instance (a WeakMap, so entries die with the store) plus
+ * the array path, mirroring the chunk-cache key of {@link createCacheKey}, so
+ * distinct `zarr.open` handles onto the same array share one entry.
+ *
+ * The promise is memoised, not the value, so concurrent `getWorker` calls on a
+ * cold array share one resolution instead of racing store reads.
+ */
+const resolvedArrayInfo = new WeakMap<
+  object,
+  Map<string, Promise<ArrayMetadata>>
+>()
+
+/**
+ * Read array metadata and probe the actual chunk shape, once per
+ * (store, array path) — repeat calls return the memoised promise without
+ * touching the store.
+ *
+ * The returned metadata's `codecMeta.chunk_shape` already carries the probe's
+ * correction, so it describes the chunks as stored, not as the metadata
+ * claimed.
+ *
+ * `storeOpts` only reaches the store on the call that performs the resolution;
+ * memoised results are shared across callers regardless of their options. A
+ * rejected resolution is evicted so a transient store failure is retried by
+ * the next call instead of becoming permanent.
+ */
+export function resolveArrayInfo<D extends DataType, Store extends Readable>(
+  arr: ZarrArray<D, Store>,
+  storeOpts?: Parameters<Store["get"]>[1],
+): Promise<ArrayMetadata> {
+  let infoByPath = resolvedArrayInfo.get(arr.store)
+  if (!infoByPath) {
+    infoByPath = new Map()
+    resolvedArrayInfo.set(arr.store, infoByPath)
+  }
+  const memoised = infoByPath.get(arr.path)
+  if (memoised) return memoised
+
+  const promise = (async (): Promise<ArrayMetadata> => {
+    const { codecMeta, encodeChunkKey, fillValue } = await readArrayMetadata(arr)
+    const Ctr = get_ctr(arr.dtype)
+    const bytesPerElement = (Ctr as unknown as { BYTES_PER_ELEMENT: number })
+      .BYTES_PER_ELEMENT
+    // The probe's fetches run under `storeOpts`, so its abort detection has
+    // to watch the same signal — otherwise its catch-alls would swallow an
+    // abort as a store failure and hand back the fallback shape.
+    const signal = (storeOpts as { signal?: AbortSignal } | undefined)?.signal
+    const chunkShape = await probeActualChunkShape(
+      arr,
+      encodeChunkKey,
+      codecMeta,
+      bytesPerElement,
+      storeOpts,
+      signal,
+    )
+    return {
+      codecMeta:
+        chunkShape !== codecMeta.chunk_shape
+          ? { ...codecMeta, chunk_shape: chunkShape }
+          : codecMeta,
+      encodeChunkKey,
+      fillValue,
+    }
+  })()
+
+  const paths = infoByPath
+  paths.set(arr.path, promise)
+  promise.catch(() => {
+    if (paths.get(arr.path) === promise) {
+      paths.delete(arr.path)
+    }
+  })
+  return promise
+}
+
+// ---------------------------------------------------------------------------
 // getWorker
 // ---------------------------------------------------------------------------
 
@@ -830,8 +921,13 @@ export async function getWorker<
     assertSharedArrayBufferAvailable()
   }
 
-  // Read metadata from store — single read, single parse
-  const { codecMeta, encodeChunkKey, fillValue } = await readArrayMetadata(
+  // Metadata read + chunk-shape probe, memoised per (store, array path):
+  // only the first call on an array pays the store round-trips, so repeat
+  // reads served from a warm chunk cache never touch the store at all.
+  // codecMeta.chunk_shape is already the probed (possibly corrected) shape.
+  // Runs under `storeOpts`, so the store reads it makes carry the combined
+  // signal.
+  const { codecMeta, encodeChunkKey, fillValue } = await resolveArrayInfo(
     arr,
     storeOpts,
   )
@@ -840,42 +936,25 @@ export async function getWorker<
   const bytesPerElement = (Ctr as unknown as { BYTES_PER_ELEMENT: number })
     .BYTES_PER_ELEMENT
 
-  // Probe actual chunk shape — detects metadata vs data mismatch
-  const actualChunkShape = await probeActualChunkShape(
-    arr,
-    encodeChunkKey,
-    codecMeta,
-    bytesPerElement,
-    storeOpts,
-    // The probe's fetches run under the combined signal, so its abort
-    // detection has to watch the same one — with only `signal`, a store-level
-    // abort would be swallowed by the probe's catch-alls.
-    fetchSignal,
-  )
-
   // Checkpoint for stores that ignore the signal: their metadata and probe
-  // reads complete instead of rejecting, and this is the last await before
-  // the pool (whose own signal handling covers the rest) — without it, a
-  // fully-cached read would return data after its caller already walked away.
-  // Watches the combined signal so a store-level abort is caught too.
+  // reads complete instead of rejecting — and a memoised resolution never
+  // touches the store at all — and this is the last await before the pool
+  // (whose own signal handling covers the rest). Without it, a fully-cached
+  // read would return data after its caller already walked away. Watches the
+  // combined signal so a store-level abort is caught too.
   if (fetchSignal?.aborted) {
     throw fetchSignal.reason
   }
 
-  // Update codecMeta to use the actual chunk shape for codec pipeline
-  const correctedCodecMeta =
-    actualChunkShape !== codecMeta.chunk_shape
-      ? { ...codecMeta, chunk_shape: actualChunkShape }
-      : codecMeta
-
   // Get stable metaId for the codec metadata (used by worker-rpc meta-init)
-  const metaId = getMetaId(correctedCodecMeta)
+  const metaId = getMetaId(codecMeta)
 
   // Set up the indexer with the actual (possibly corrected) chunk shape
+  const chunkShape = codecMeta.chunk_shape
   const indexer = new BasicIndexer({
     selection,
     shape: arr.shape,
-    chunk_shape: actualChunkShape,
+    chunk_shape: chunkShape,
   })
 
   // Allocate output — backed by SharedArrayBuffer when requested
@@ -884,9 +963,6 @@ export async function getWorker<
   const data = new Ctr(buffer as ArrayBuffer, 0, size)
   const outStride = get_strides(indexer.shape)
   const out = setter.prepare(data, indexer.shape, outStride) as Chunk<D>
-
-  // Pre-compute chunk invariants (hoisted out of loop)
-  const chunkShape = actualChunkShape
 
   // Build tasks — one per chunk
   const tasks: WorkerPoolTask<void>[] = []
@@ -959,7 +1035,7 @@ export async function getWorker<
               worker,
               rawBytes,
               metaId,
-              correctedCodecMeta,
+              codecMeta,
               buffer as SharedArrayBuffer,
               size * bytesPerElement,
               outStride,
@@ -999,7 +1075,7 @@ export async function getWorker<
             worker,
             rawBytes,
             metaId,
-            correctedCodecMeta,
+            codecMeta,
             isEdgeChunk ? edgeChunkShape : undefined,
           )
         } catch (error) {

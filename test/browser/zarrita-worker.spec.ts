@@ -2256,8 +2256,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
 
       // Hold reads of c/1 open until every caller has asked for it. Only c/1 is
       // gated: the shape probe reads c/0 before any task runs, so gating that
-      // would stall all three callers before they reached the task phase and
-      // nothing would ever overlap.
+      // would stall the shared metadata resolution and nothing would ever
+      // overlap.
       const originalGet = arr.store.get.bind(arr.store)
       const chunkPaths: string[] = []
       let gatedRequests = 0
@@ -2276,6 +2276,21 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
         return originalGet(path, ...rest)
       }
 
+      // Metadata and the shape probe are memoised per array, so callers two
+      // and three perform no store I/O of their own before their task phase —
+      // store reads can no longer signal that every caller is under way.
+      // Submitting tasks is the observable that remains: with free slots in
+      // the pool, runTasks invokes each task function synchronously, and a
+      // c/1 task's first act is to register in the in-flight map, joining the
+      // gated fetch rather than re-issuing it. Three runTasks calls therefore
+      // mean every caller's c/1 task has already joined.
+      let runTasksCalls = 0
+      const originalRunTasks = pool.runTasks.bind(pool)
+      ;(pool as any).runTasks = (...args: any[]) => {
+        runTasksCalls += 1
+        return originalRunTasks(...args)
+      }
+
       const waitFor = async (ready: () => boolean, label: string) => {
         const deadline = Date.now() + 5000
         while (!ready()) {
@@ -2290,19 +2305,13 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
         getWorker(arr, null, { pool }),
       ]
 
-      // Release only once every caller is demonstrably at the point of wanting
-      // c/1, rather than after a fixed sleep.
-      //
-      // The gated-request count cannot be the signal — dedup working means only
-      // one request ever reaches the gate, so waiting for three would hang on a
-      // passing run. The shape probe is the observable that survives dedup: it
-      // reads c/0 once per call, outside the task path, before that call builds
-      // any tasks. Three c/0 reads therefore means all three callers are past
-      // probing and into their task phase, and a task's first act is the
-      // store.get for its chunk — no I/O in between.
+      // Release only once every caller is demonstrably past the point of
+      // wanting c/1, rather than after a fixed sleep. The gated-request count
+      // alone cannot be the signal — dedup working means only one request ever
+      // reaches the gate, so waiting for three would hang on a passing run.
       await waitFor(
-        () => chunkPaths.filter((path) => path.endsWith('/c/0')).length >= 3,
-        'all three callers to finish probing',
+        () => runTasksCalls >= 3,
+        'all three callers to submit their tasks',
       )
       await waitFor(() => gatedRequests >= 1, 'the shared c/1 fetch to begin')
       release()

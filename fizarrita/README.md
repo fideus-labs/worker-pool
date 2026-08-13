@@ -178,6 +178,11 @@ Cache keys use the format `store_N:/array/path:c/0/1/2`. A `WeakMap`-based
 store ID ensures keys are unique across store instances, so a single cache can
 safely be shared across multiple arrays and stores.
 
+The array metadata read and the chunk-shape probe are memoised per
+(store, array path) — both are immutable for the lifetime of an array — so
+only the first `getWorker` call on an array touches the store for them. A
+repeat read served entirely from a warm cache performs zero store requests.
+
 ### LRU / bounded caches
 
 For bounded memory, pass any LRU cache that implements the same `get`/`set`

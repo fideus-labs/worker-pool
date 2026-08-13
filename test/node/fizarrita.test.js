@@ -60,6 +60,31 @@ async function withPool(size, fn) {
   }
 }
 
+/** A Map store that records every `get`, so tests can count store round-trips. */
+class CountingStore extends Map {
+  reads = []
+  get(key) {
+    this.reads?.push(key)
+    return super.get(key)
+  }
+}
+
+/** An 8x8 int32 array over 4x4 chunks on a CountingStore, fully populated. */
+async function makeCountedArray() {
+  const store = new CountingStore()
+  const arr = await zarr.create(zarr.root(store).resolve('/data'), {
+    shape: [8, 8],
+    chunk_shape: [4, 4],
+    data_type: 'int32',
+  })
+  await zarr.set(arr, null, {
+    data: Int32Array.from({ length: 64 }, (_, i) => i),
+    shape: [8, 8],
+    stride: [8, 1],
+  })
+  return { store, arr }
+}
+
 test('setWorker/getWorker round-trip a scalar fill', async () => {
   const arr = await makeArray({ shape: [8, 8], chunk_shape: [4, 4] })
 
@@ -432,9 +457,11 @@ test('a concurrent read survives another read aborting their shared chunks', { t
 
       const readB = getWorker(arr, null, { pool: poolB })
       // B re-reads the unparked first chunk itself (A's share of it has long
-      // settled), then joins A's parked in-flight fetches as a follower.
+      // settled), then joins A's parked in-flight fetches as a follower. Three
+      // reads of that chunk by then: A's shape probe, A's fetch, B's fetch —
+      // B does not probe, the array info is memoised from A's resolution.
       await waitFor(
-        () => store.chunkGets.filter((k) => k === '/data/c/0/0').length >= 4,
+        () => store.chunkGets.filter((k) => k === '/data/c/0/0').length >= 3,
         'read B should have read the first chunk',
       )
       // Wait for B to have progressed into fetching additional chunks. Since
@@ -479,5 +506,86 @@ test('a decode failure rejects instead of hanging', { timeout: 15_000 }, async (
 
   await withPool(1, async (pool) => {
     await assert.rejects(getWorker(arr, null, { pool }))
+  })
+})
+
+// Issue #6 — the metadata read and chunk-shape probe used to run on every
+// getWorker call, ahead of the chunk cache, so a fully populated cache could
+// never eliminate them. Both are now memoised per (store, array path).
+
+test('a warm chunk cache serves a repeat read with zero store round-trips', async () => {
+  const { store, arr } = await makeCountedArray()
+
+  await withPool(2, async (pool) => {
+    const cache = new Map()
+    store.reads.length = 0
+    const first = await getWorker(arr, null, { pool, cache })
+    assert.ok(
+      store.reads.includes('/data/zarr.json'),
+      'the first read resolves metadata from the store',
+    )
+
+    store.reads.length = 0
+    const second = await getWorker(arr, null, { pool, cache })
+    assert.deepEqual(Array.from(second.data), Array.from(first.data))
+    assert.deepEqual(store.reads, [], 'the repeat read never touches the store')
+  })
+})
+
+test('repeat reads without a cache pay only the chunk fetches', async () => {
+  const { store, arr } = await makeCountedArray()
+
+  await withPool(2, async (pool) => {
+    await getWorker(arr, null, { pool })
+
+    store.reads.length = 0
+    await getWorker(arr, null, { pool })
+    assert.deepEqual(
+      [...store.reads].sort(),
+      ['/data/c/0/0', '/data/c/0/1', '/data/c/1/0', '/data/c/1/1'],
+      'no metadata read, no probe — one fetch per chunk',
+    )
+  })
+})
+
+test('concurrent reads on a cold array share one metadata read and one probe', async () => {
+  const { store, arr } = await makeCountedArray()
+
+  await withPool(2, async (pool) => {
+    const cache = new Map()
+    store.reads.length = 0
+    const [a, b] = await Promise.all([
+      getWorker(arr, null, { pool, cache }),
+      getWorker(arr, null, { pool, cache }),
+    ])
+    assert.deepEqual(Array.from(a.data), Array.from(b.data))
+
+    const metadataReads = store.reads.filter((k) => k === '/data/zarr.json')
+    assert.equal(metadataReads.length, 1, 'one zarr.json read for both calls')
+    // 1 metadata read + 1 probe of c/0/0 + 4 chunk fetches: the probe and the
+    // chunk fetch of c/0/0 both count, everything else exactly once.
+    assert.equal(store.reads.length, 6, `reads: ${store.reads.join(', ')}`)
+  })
+})
+
+test('a failed metadata read is retried, not memoised', async () => {
+  const { store, arr } = await makeCountedArray()
+
+  let failures = 1
+  const realGet = CountingStore.prototype.get.bind(store)
+  store.get = (key) => {
+    if (failures > 0) {
+      failures--
+      throw new Error('transient store failure')
+    }
+    return realGet(key)
+  }
+
+  await withPool(2, async (pool) => {
+    await assert.rejects(getWorker(arr, null, { pool }), /transient/)
+
+    const result = await getWorker(arr, null, { pool })
+    assert.deepEqual(result.shape, [8, 8])
+    assert.equal(result.data[63], 63)
   })
 })
