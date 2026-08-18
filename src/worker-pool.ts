@@ -1,6 +1,7 @@
 import type {
   WorkerPoolTask,
   WorkerPoolProgressCallback,
+  WorkerPoolRunTasksOptions,
   WorkerPoolRunTasksResult,
   WorkerLike,
   RunInfo,
@@ -89,12 +90,16 @@ class WorkerPool {
    * @param taskFns          - Array of task functions.
    * @param progressCallback - Optional callback invoked after each task
    *                           completes.
+   * @param options          - Optional settings; `options.signal` aborts the
+   *                           batch, dropping tasks that have not started and
+   *                           rejecting the promise with the signal's reason.
    * @returns An object with a `promise` that resolves with ordered results and
    *          a `runId` for cancellation.
    */
   runTasks<T>(
     taskFns: Array<WorkerPoolTask<T>>,
-    progressCallback: WorkerPoolProgressCallback | null = null
+    progressCallback: WorkerPoolProgressCallback | null = null,
+    options: WorkerPoolRunTasksOptions = {}
   ): WorkerPoolRunTasksResult<T> {
     const info: RunInfo<T> = {
       taskQueue: [],
@@ -115,6 +120,29 @@ class WorkerPool {
       promise: new Promise<T[]>((resolve, reject) => {
         info.resolve = resolve
         info.reject = reject
+
+        const signal = options.signal
+        if (signal != null) {
+          // A signal that has already fired means no task should start at all.
+          if (signal.aborted) {
+            reject(signal.reason)
+            this.clearTask(info.index)
+            return
+          }
+          // Reject before clearing: `clearTask` swaps `reject` for a no-op.
+          // Clearing empties `taskQueue`, which is what drops the tasks that
+          // have not started; tasks already holding a slot keep running, and
+          // the `cleared` guards on their settle paths keep them from writing
+          // into the torn-down run while still returning their slots.
+          const onAbort = (): void => {
+            info.reject!(signal.reason)
+            this.clearTask(info.index)
+          }
+          signal.addEventListener('abort', onAbort)
+          info.abortCleanup = () => {
+            signal.removeEventListener('abort', onAbort)
+          }
+        }
 
         info.results = new Array<T>(taskFns.length)
         info.completedTasks = 0
@@ -181,7 +209,15 @@ class WorkerPool {
   ): void {
     const info = this.runInfo[infoIndex] as RunInfo<T> | undefined
 
-    if (info?.canceled === true) {
+    // A dispatch can land on a run that has already settled: the postponed
+    // retry fires from a timer, and an abort or a failure may have torn the
+    // run down in the meantime. Its task must not start — the caller was
+    // already answered — and there is nothing to reject a second time.
+    if (info == null || info.cleared) {
+      return
+    }
+
+    if (info.canceled === true) {
       info.reject!('Remaining tasks canceled')
       this.clearTask(info.index)
       return
@@ -291,6 +327,8 @@ class WorkerPool {
   private clearTask(clearIndex: number): void {
     const info = this.runInfo[clearIndex]
     info.cleared = true
+    info.abortCleanup?.()
+    info.abortCleanup = undefined
     info.results = []
     info.taskQueue = []
     info.progressCallback = null

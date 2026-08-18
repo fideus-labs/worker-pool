@@ -49,6 +49,21 @@ export type WorkerPoolProgressCallback = (
 ) => void
 
 /**
+ * Options for {@link WorkerPool.runTasks}.
+ */
+export interface WorkerPoolRunTasksOptions {
+  /**
+   * Aborts the batch. When the signal fires, tasks that have not started are
+   * dropped and the run's promise rejects with the signal's reason. Tasks
+   * already running are not interrupted, but their results are discarded and
+   * their workers are returned to the pool as they finish.
+   *
+   * A signal that is already aborted rejects the batch before any task starts.
+   */
+  signal?: AbortSignal
+}
+
+/**
  * Return type of {@link WorkerPool.runTasks}.
  */
 export interface WorkerPoolRunTasksResult<T> {
@@ -80,6 +95,12 @@ export interface RunInfo<T> {
    * before touching any of it.
    */
   cleared: boolean
+  /**
+   * Detaches the run's `'abort'` listener from the caller's signal. Set only
+   * when the run was given one; called by `clearTask` so a long-lived signal
+   * does not keep firing into — or keep alive — a run that has settled.
+   */
+  abortCleanup?: () => void
   resolve?: (results: T[]) => void
   reject?: (error: unknown) => void
 }

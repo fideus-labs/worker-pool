@@ -83,7 +83,18 @@ export function createCacheKey<D extends DataType, Store extends Readable>(
  * map is what closes the window between "someone started fetching this" and
  * "the result is cacheable".
  */
-const pendingChunks = new Map<string, Promise<Chunk<DataType>>>()
+interface PendingChunk {
+  promise: Promise<Chunk<DataType>>
+  /**
+   * The abort signal the producing fetch runs under, if any. A follower whose
+   * shared promise rejects checks this to tell "the producer's caller walked
+   * away" apart from a real failure — precisely, rather than by sniffing the
+   * rejection's shape, which a custom abort reason would defeat.
+   */
+  signal?: AbortSignal
+}
+
+const pendingChunks = new Map<string, PendingChunk>()
 
 /**
  * Run `produce` once per key, handing concurrent callers the same promise.
@@ -93,21 +104,33 @@ const pendingChunks = new Map<string, Promise<Chunk<DataType>>>()
  * fulfilment would duplicate the cache while pinning chunks the cache has since
  * evicted. Removal is conditional on the entry still being ours so a later
  * attempt that already replaced it is not dropped by our own settlement.
+ *
+ * Alongside the promise the caller gets `producerSignal` — the signal the
+ * producing fetch runs under, its own `signal` when it became the producer.
+ * The pair is what lets a follower retry a chunk whose producer aborted.
  */
 function shareInFlightChunk<D extends DataType>(
   key: string,
   produce: () => Promise<Chunk<D>>,
-): Promise<Chunk<D>> {
+  signal?: AbortSignal,
+): { promise: Promise<Chunk<D>>; producerSignal?: AbortSignal } {
   const inFlight = pendingChunks.get(key)
   if (inFlight) {
-    return inFlight as Promise<Chunk<D>>
+    return {
+      promise: inFlight.promise as Promise<Chunk<D>>,
+      producerSignal: inFlight.signal,
+    }
   }
 
   const promise = produce()
-  pendingChunks.set(key, promise as unknown as Promise<Chunk<DataType>>)
+  const entry: PendingChunk = {
+    promise: promise as unknown as Promise<Chunk<DataType>>,
+    signal,
+  }
+  pendingChunks.set(key, entry)
 
   const forget = () => {
-    if (pendingChunks.get(key) === (promise as unknown)) {
+    if (pendingChunks.get(key) === entry) {
       pendingChunks.delete(key)
     }
   }
@@ -115,7 +138,7 @@ function shareInFlightChunk<D extends DataType>(
   // still receives `promise` itself and still sees the rejection.
   promise.then(forget, forget)
 
-  return promise
+  return { promise, producerSignal: signal }
 }
 
 // ---------------------------------------------------------------------------
@@ -131,14 +154,17 @@ export interface ArrayMetadata {
 export async function readArrayMetadata<
   D extends DataType,
   Store extends Readable,
->(arr: ZarrArray<D, Store>): Promise<ArrayMetadata> {
+>(
+  arr: ZarrArray<D, Store>,
+  storeOpts?: Parameters<Store["get"]>[1],
+): Promise<ArrayMetadata> {
   const store = arr.store
 
   // Try v3 first: read zarr.json
   const v3Path = (
     arr.path === "/" ? "/zarr.json" : `${arr.path}/zarr.json`
   ) as `/${string}`
-  const v3Bytes = await store.get(v3Path)
+  const v3Bytes = await store.get(v3Path, storeOpts)
   if (v3Bytes) {
     const metadata = JSON.parse(decoder.decode(v3Bytes))
     return {
@@ -156,7 +182,7 @@ export async function readArrayMetadata<
   const v2Path = (
     arr.path === "/" ? "/.zarray" : `${arr.path}/.zarray`
   ) as `/${string}`
-  const v2Bytes = await store.get(v2Path)
+  const v2Bytes = await store.get(v2Path, storeOpts)
   if (v2Bytes) {
     const metadata = JSON.parse(decoder.decode(v2Bytes))
     const codecs: Array<{
@@ -560,6 +586,7 @@ async function validateCandidateChunkShape<
   encodeChunkKey: (chunk_coords: number[]) => string,
   candidate: number[],
   storeOpts?: Parameters<Store["get"]>[1],
+  signal?: AbortSignal,
 ): Promise<boolean> {
   const ndim = candidate.length
 
@@ -595,7 +622,9 @@ async function validateCandidateChunkShape<
     const probeBytes = await arr.store.get(probePath, storeOpts)
     // If data returned, there's a chunk beyond our expected grid → reject
     return !probeBytes
-  } catch {
+  } catch (error) {
+    // A caller abort is not a probe outcome — the whole read is over.
+    if (signal?.aborted) throw error
     // Fetch error (404, network error) → no chunk there → accept
     return true
   }
@@ -627,6 +656,7 @@ export async function probeActualChunkShape<
   codecMeta: CodecChunkMeta,
   bytesPerElement: number,
   storeOpts?: Parameters<Store["get"]>[1],
+  signal?: AbortSignal,
 ): Promise<number[]> {
   const metadataChunkShape = codecMeta.chunk_shape
   const metaElements = metadataChunkShape.reduce((a, b) => a * b, 1)
@@ -670,6 +700,7 @@ export async function probeActualChunkShape<
         encodeChunkKey,
         candidate,
         storeOpts,
+        signal,
       )
       if (isValid) {
         console.warn(
@@ -689,7 +720,10 @@ export async function probeActualChunkShape<
         `Using inferred chunk_shape: ${JSON.stringify(fallback)} (unvalidated)`,
     )
     return fallback
-  } catch {
+  } catch (error) {
+    // The catch-all exists to degrade gracefully when the probe fetch fails;
+    // a caller abort is not that — it has to stop the whole read.
+    if (signal?.aborted) throw error
     return metadataChunkShape
   }
 }
@@ -697,6 +731,31 @@ export async function probeActualChunkShape<
 // ---------------------------------------------------------------------------
 // getWorker
 // ---------------------------------------------------------------------------
+
+/**
+ * Combine two abort signals into one that fires when either does.
+ *
+ * `AbortSignal.any` where available; on runtimes that predate it (Safari
+ * before 17.4, Node before 20.3) a controller bridge. The bridge's listeners
+ * stay on the parent signals for the parents' lifetime — acceptable for
+ * one-shot read signals, which is the only way this module uses them.
+ */
+function combineAbortSignals(a: AbortSignal, b: AbortSignal): AbortSignal {
+  if (typeof AbortSignal.any === "function") {
+    return AbortSignal.any([a, b])
+  }
+  if (a.aborted) return a
+  if (b.aborted) return b
+  const controller = new AbortController()
+  const forward = (signal: AbortSignal) => {
+    signal.addEventListener("abort", () => controller.abort(signal.reason), {
+      once: true,
+    })
+  }
+  forward(a)
+  forward(b)
+  return controller.signal
+}
 
 /**
  * Read data from a zarrita Array with codec decoding offloaded to Web Workers.
@@ -742,16 +801,40 @@ export async function getWorker<
       ? Chunk<D>
       : Scalar<D>
 > {
-  const { pool, workerUrl } = opts
+  const { pool, workerUrl, signal } = opts
   const useShared = !!opts.useSharedArrayBuffer
   const cache = opts.cache ?? NULL_CACHE
+
+  // Not `throwIfAborted()`: some runtimes grew `AbortSignal` before that
+  // method, and on them the call itself would throw a TypeError on every
+  // signalled read, aborted or not.
+  if (signal?.aborted) {
+    throw signal.reason
+  }
+
+  // The signal actually handed to `store.get`: the caller may already carry a
+  // store-level signal inside `opts.opts`, and folding ours in must not
+  // silently disconnect it — either firing aborts the fetch.
+  const storeSignal = (opts.opts as { signal?: AbortSignal } | undefined)
+    ?.signal
+  const fetchSignal =
+    signal && storeSignal
+      ? combineAbortSignals(signal, storeSignal)
+      : (signal ?? storeSignal)
+  const storeOpts =
+    fetchSignal === storeSignal
+      ? opts.opts
+      : ({ ...(opts.opts as object), signal: fetchSignal } as typeof opts.opts)
 
   if (useShared) {
     assertSharedArrayBufferAvailable()
   }
 
   // Read metadata from store — single read, single parse
-  const { codecMeta, encodeChunkKey, fillValue } = await readArrayMetadata(arr)
+  const { codecMeta, encodeChunkKey, fillValue } = await readArrayMetadata(
+    arr,
+    storeOpts,
+  )
 
   const Ctr = get_ctr(arr.dtype)
   const bytesPerElement = (Ctr as unknown as { BYTES_PER_ELEMENT: number })
@@ -763,8 +846,21 @@ export async function getWorker<
     encodeChunkKey,
     codecMeta,
     bytesPerElement,
-    opts.opts,
+    storeOpts,
+    // The probe's fetches run under the combined signal, so its abort
+    // detection has to watch the same one — with only `signal`, a store-level
+    // abort would be swallowed by the probe's catch-alls.
+    fetchSignal,
   )
+
+  // Checkpoint for stores that ignore the signal: their metadata and probe
+  // reads complete instead of rejecting, and this is the last await before
+  // the pool (whose own signal handling covers the rest) — without it, a
+  // fully-cached read would return data after its caller already walked away.
+  // Watches the combined signal so a store-level abort is caught too.
+  if (fetchSignal?.aborted) {
+    throw fetchSignal.reason
+  }
 
   // Update codecMeta to use the actual chunk shape for codec pipeline
   const correctedCodecMeta =
@@ -836,16 +932,25 @@ export async function getWorker<
       }
     }
 
-    tasks.push(async (workerSlot: WorkerLike | null) => {
-      const worker = workerSlot ?? createCodecWorker(workerUrl)
-
+    /**
+     * The task proper. Wrapped below so a worker created *by the task* is
+     * terminated when the task throws: the pool terminates the slot it lent
+     * on failure, but a worker created here never reached the pool — the
+     * `{ worker }` return that would have introduced it is exactly what a
+     * throw skips — so nothing else can shut it down, and a leaked
+     * `node:worker_threads` thread keeps the whole process alive. An aborted
+     * fetch is the common way to land here.
+     */
+    const runTask = async (
+      worker: WorkerLike,
+    ): Promise<{ worker: WorkerLike; result: void }> => {
       // SAB path (no cache): the worker decodes AND writes directly into *this*
       // call's SharedArrayBuffer, using *this* call's mapping — no transfer
       // back, no main-thread copy. There is no standalone chunk here to hand to
       // anyone else, so this path cannot participate in sharing and is left
       // exactly as it was.
       if (useShared && !opts.cache) {
-        const rawBytes = await arr.store.get(chunkPath, opts.opts)
+        const rawBytes = await arr.store.get(chunkPath, storeOpts)
         if (!rawBytes) {
           setter.set_from_chunk(out, buildFillChunk(), mapping)
         } else {
@@ -884,8 +989,8 @@ export async function getWorker<
       // parallelism — but that slot would otherwise have been spent on a
       // duplicate network round-trip and a duplicate decompression of bytes
       // already in flight, so it is not work being given up.
-      const chunk = await shareInFlightChunk<D>(cacheKey, async () => {
-        const rawBytes = await arr.store.get(chunkPath, opts.opts)
+      const produce = async (): Promise<Chunk<D>> => {
+        const rawBytes = await arr.store.get(chunkPath, storeOpts)
         if (!rawBytes) {
           return buildFillChunk()
         }
@@ -901,7 +1006,34 @@ export async function getWorker<
           worker.terminate()
           throw error
         }
-      })
+      }
+
+      // The shared fetch runs with its *producer's* signal, so a concurrent
+      // read aborting can fail a chunk this read still wants. Such a foreign
+      // abort — a fired producer signal that is not our own — is retried: the
+      // settled entry has already been forgotten, so the retry produces (or
+      // joins) a fresh in-flight fetch carrying this read's own signal. Our
+      // own abort, and every real failure, still propagates. The loop cannot
+      // spin on itself: once we are the producer, `producerSignal` is
+      // `fetchSignal` and the foreign-abort test can no longer pass.
+      let chunk: Chunk<D>
+      for (;;) {
+        const { promise, producerSignal } = shareInFlightChunk<D>(
+          cacheKey,
+          produce,
+          fetchSignal,
+        )
+        try {
+          chunk = await promise
+          break
+        } catch (error) {
+          const foreignAbort =
+            producerSignal !== fetchSignal && producerSignal?.aborted === true
+          if (!foreignAbort || fetchSignal?.aborted) {
+            throw error
+          }
+        }
+      }
 
       // Populate *this* read's cache, whoever produced the chunk. Sharing is
       // keyed on the chunk, not on the cache, so the producer may have been a
@@ -922,12 +1054,28 @@ export async function getWorker<
       setter.set_from_chunk(out, chunk, mapping)
 
       return { worker, result: undefined as void }
+    }
+
+    tasks.push(async (workerSlot: WorkerLike | null) => {
+      const worker = workerSlot ?? createCodecWorker(workerUrl)
+      try {
+        return await runTask(worker)
+      } catch (error) {
+        if (workerSlot == null) {
+          worker.terminate()
+        }
+        throw error
+      }
     })
   }
 
-  // Execute all tasks with bounded concurrency via WorkerPool
+  // Execute all tasks with bounded concurrency via WorkerPool. The combined
+  // signal is handed to the pool, which drops still-queued tasks when either
+  // source fires and rejects the run with that signal's reason — with only
+  // `signal`, a store-level abort would leave queued tasks dispatching just
+  // to fail on their own fetches.
   if (tasks.length > 0) {
-    const { promise } = pool.runTasks(tasks)
+    const { promise } = pool.runTasks(tasks, null, { signal: fetchSignal })
     await promise
   }
 

@@ -8,6 +8,7 @@ export type { NodeWorkerOptions } from './node-worker.js'
 export type {
   WorkerPoolTask,
   WorkerPoolProgressCallback,
+  WorkerPoolRunTasksOptions,
   WorkerPoolRunTasksResult,
   WorkerLike,
   WorkerMessageEventLike,

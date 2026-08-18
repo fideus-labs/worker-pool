@@ -270,6 +270,202 @@ test('DEFAULT_WORKER_URL still points at the browser entry', () => {
   assert.ok(DEFAULT_WORKER_URL.href.endsWith('/codec-worker.js'))
 })
 
+/** Poll until `predicate` holds, failing the test after ~2s rather than hanging. */
+async function waitFor(predicate, message) {
+  for (let i = 0; i < 200; i++) {
+    if (predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  assert.fail(message)
+}
+
+/**
+ * A Map-backed store whose `get` honours `{ signal }` the way fetch does: a
+ * fired signal rejects the read with the signal's reason. Keys matching `hold`
+ * are parked until `releaseHeld()`, so a test controls when the signal fires
+ * relative to in-flight fetches.
+ */
+class AbortableStore {
+  constructor() {
+    this.map = new Map()
+    this.gets = []
+    this.hold = null
+    this.parked = []
+  }
+
+  async get(key, opts) {
+    this.gets.push(key)
+    const signal = opts?.signal
+    signal?.throwIfAborted()
+    if (this.hold?.(key)) {
+      await new Promise((resolve, reject) => {
+        this.parked.push(resolve)
+        signal?.addEventListener(
+          'abort',
+          () => {
+            // An aborted read is no longer parked — heldCount tracks live ones.
+            const index = this.parked.indexOf(resolve)
+            if (index !== -1) this.parked.splice(index, 1)
+            reject(signal.reason)
+          },
+          { once: true },
+        )
+      })
+    }
+    return this.map.get(key)
+  }
+
+  async set(key, value) {
+    this.map.set(key, value)
+  }
+
+  /** Stop holding — current parked reads resolve, future reads pass through. */
+  releaseHeld() {
+    this.hold = null
+    for (const release of this.parked.splice(0)) release()
+  }
+
+  get heldCount() {
+    return this.parked.length
+  }
+
+  get chunkGets() {
+    return this.gets.filter((key) => key.startsWith('/data/c/'))
+  }
+}
+
+async function makeAbortableArray() {
+  const store = new AbortableStore()
+  const arr = await zarr.create(zarr.root(store).resolve('/data'), {
+    shape: [8, 8],
+    chunk_shape: [4, 4],
+    data_type: 'int32',
+  })
+  const data = {
+    data: Int32Array.from({ length: 64 }, (_, i) => i),
+    shape: [8, 8],
+    stride: [8, 1],
+  }
+  await zarr.set(arr, null, data)
+  store.gets = []
+  return { store, arr, data }
+}
+
+test('an already-aborted signal rejects getWorker before any store read', async () => {
+  const { store, arr } = await makeAbortableArray()
+
+  await withPool(1, async (pool) => {
+    const controller = new AbortController()
+    controller.abort(new Error('stale tile'))
+    await assert.rejects(
+      getWorker(arr, null, { pool, signal: controller.signal }),
+      /stale tile/,
+    )
+  })
+
+  assert.deepEqual(store.gets, [], 'the store was never touched')
+})
+
+test('aborting mid-read cancels the in-flight fetch and drops the queued ones', async () => {
+  const { store, arr } = await makeAbortableArray()
+  // Park every chunk fetch except the first chunk, which the shape probe and
+  // the first task read — the abort should land while a later chunk fetch is
+  // in flight and two more are still queued on the pool.
+  store.hold = (key) => key.startsWith('/data/c/') && key !== '/data/c/0/0'
+
+  await withPool(1, async (pool) => {
+    const controller = new AbortController()
+    const read = getWorker(arr, null, { pool, signal: controller.signal })
+
+    await waitFor(() => store.heldCount === 1, 'a chunk fetch should be parked')
+    controller.abort(new Error('panned away'))
+    await assert.rejects(read, /panned away/)
+  })
+
+  // Let any stray dispatch surface before asserting there was none.
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  // Shape probe + first-chunk task + the one parked fetch: the two chunks
+  // still queued when the signal fired were never fetched.
+  assert.equal(store.chunkGets.length, 3, `chunk reads: ${store.chunkGets}`)
+})
+
+// A signal supplied only at the store level (inside `opts.opts`) gets the
+// same treatment as `opts.signal`: the pool runs under the combined signal,
+// so queued tasks are dropped rather than dispatched into failing fetches.
+test('a store-level signal alone also drops the queued tasks', async () => {
+  const { store, arr } = await makeAbortableArray()
+  store.hold = (key) => key.startsWith('/data/c/') && key !== '/data/c/0/0'
+
+  await withPool(1, async (pool) => {
+    const controller = new AbortController()
+    const read = getWorker(arr, null, {
+      pool,
+      opts: { signal: controller.signal },
+    })
+
+    await waitFor(() => store.heldCount === 1, 'a chunk fetch should be parked')
+    controller.abort(new Error('store walked away'))
+    await assert.rejects(read, /store walked away/)
+  })
+
+  // Wait for all parked fetches to be released/aborted before asserting
+  // the count. This ensures no in-flight operations are still active.
+  await waitFor(() => store.heldCount === 0, 'all parked fetches should be released')
+  assert.equal(store.chunkGets.length, 3, `chunk reads: ${store.chunkGets}`)
+})
+
+// Concurrent reads of the same chunks share one fetch, and that fetch runs
+// with its producer's signal. A read that did not abort must survive its
+// producer walking away — by re-fetching the chunk itself — even when the
+// abort carried a custom reason.
+test('a concurrent read survives another read aborting their shared chunks', { timeout: 15_000 }, async () => {
+  const { store, arr, data } = await makeAbortableArray()
+  store.hold = (key) => key.startsWith('/data/c/') && key !== '/data/c/0/0'
+
+  await withPool(2, async (poolA) => {
+    await withPool(2, async (poolB) => {
+      const controller = new AbortController()
+      const readA = getWorker(arr, null, { pool: poolA, signal: controller.signal })
+
+      // Both of A's parked fetches in flight — its other tasks are queued.
+      await waitFor(() => store.heldCount === 2, 'read A should have two parked fetches')
+
+      const readB = getWorker(arr, null, { pool: poolB })
+      // B re-reads the unparked first chunk itself (A's share of it has long
+      // settled), then joins A's parked in-flight fetches as a follower.
+      await waitFor(
+        () => store.chunkGets.filter((k) => k === '/data/c/0/0').length >= 4,
+        'read B should have read the first chunk',
+      )
+      // Wait for B to have progressed into fetching additional chunks. Since
+      // B joining A's in-flight fetches as a follower doesn't touch the store,
+      // we wait for either (a) B creating independent fetches (heldCount > 2),
+      // or (b) the held state to stabilize, indicating B has had the
+      // opportunity to join. We verify this by checking the held count remains
+      // at 2 (A's two parked fetches) across multiple poll iterations.
+      let stableCount = 0
+      await waitFor(() => {
+        const current = store.heldCount
+        if (current > 2) return true // B made independent fetches
+        if (current === 2) stableCount++
+        else stableCount = 0
+        return stableCount >= 3 // Stable for 3 iterations (30ms of polls)
+      }, 'read B should have attempted to join or created independent fetches')
+
+      controller.abort(new Error('viewport moved'))
+      await assert.rejects(readA, /viewport moved/)
+
+      // B's shared chunks died with A's signal; B must now be re-fetching
+      // them under its own steam. Un-park everything and let it finish.
+      await waitFor(() => store.heldCount >= 1, 'read B should retry the aborted chunks')
+      store.releaseHeld()
+
+      const result = await readB
+      assert.deepEqual(Array.from(result.data), Array.from(data.data))
+    })
+  })
+})
+
 test('a decode failure rejects instead of hanging', { timeout: 15_000 }, async () => {
   const store = new Map()
   const arr = await zarr.create(zarr.root(store).resolve('/data'), {

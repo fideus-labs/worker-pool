@@ -186,6 +186,20 @@ export interface GetWorkerOptions<StoreOpts = unknown> {
    * Cache keys use the format `store_N:/array/path:c/0/1/2`.
    */
   cache?: ChunkCache
+  /**
+   * Aborts the read. The signal is forwarded to every `store.get` call —
+   * metadata, chunk-shape probe, and chunk fetches — so stores that honour it
+   * (e.g. `FetchStore`, whose options are a `RequestInit`) cancel their
+   * requests, and chunk tasks still queued on the pool when the signal fires
+   * are dropped rather than started. The returned promise rejects with the
+   * signal's reason. A decode already running on a worker is not interrupted;
+   * its result is discarded.
+   *
+   * If `opts` carries its own store-level `signal`, the two are combined:
+   * when either fires, fetches abort, still-queued tasks are dropped, and
+   * the promise rejects with the reason of whichever signal fired.
+   */
+  signal?: AbortSignal
 }
 
 export interface SetWorkerOptions {

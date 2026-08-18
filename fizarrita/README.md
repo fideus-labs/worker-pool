@@ -57,6 +57,7 @@ const chunk = await getWorker(arr, [zarr.slice(0, 10)], { pool })
 | `opts` | `StoreOpts` | — | Pass-through options for the store's `get` method |
 | `useSharedArrayBuffer` | `boolean` | `false` | Allocate output on SharedArrayBuffer with decode-into-shared optimization |
 | `cache` | `ChunkCache` | — | Optional decoded-chunk cache to avoid redundant decompression |
+| `signal` | `AbortSignal` | — | Aborts the read: cancels in-flight store fetches, drops queued decode tasks |
 
 ### `setWorker(arr, selection, value, options)`
 
@@ -121,6 +122,38 @@ export default defineConfig({
 
 If the headers are missing, `useSharedArrayBuffer: true` throws with a
 descriptive error.
+
+## Cancelling reads
+
+A viewport-driven consumer abandons reads constantly — every pan or zoom
+obsoletes tiles still in flight. Pass an `AbortSignal` so an abandoned read
+stops consuming resources instead of running to completion:
+
+```ts
+const controller = new AbortController()
+
+const read = getWorker(arr, [zarr.slice(0, 256), zarr.slice(0, 256)], {
+  pool,
+  signal: controller.signal,
+})
+
+// The user panned away — these tiles are stale:
+controller.abort()
+```
+
+When the signal fires, the signal is forwarded to every `store.get` call, so
+stores that honour it (e.g. `FetchStore`, whose options are a `RequestInit`)
+cancel their network requests; chunk tasks still queued on the pool are
+dropped rather than started; and the returned promise rejects with the
+signal's reason. A decode already running on a worker is not interrupted —
+its result is discarded.
+
+If `opts` carries its own store-level `signal`, the two are combined: when
+either fires, fetches abort, still-queued tasks are dropped, and the promise
+rejects with the reason of whichever signal fired. A concurrent `getWorker`
+call sharing an in-flight
+chunk fetch with an aborted read is unaffected — it re-fetches the chunk
+under its own signal.
 
 ## Chunk caching
 

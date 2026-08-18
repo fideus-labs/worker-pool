@@ -371,6 +371,116 @@ test('a straggler does not refill the bookkeeping of a run that already settled'
   }
 })
 
+test('an already-aborted signal rejects the batch before any task starts', async () => {
+  const pool = new WorkerPool(2)
+  const controller = new AbortController()
+  controller.abort(new Error('too late'))
+
+  let started = 0
+  const { promise } = pool.runTasks(
+    [async () => { started++; return { worker: stubWorker(), result: 1 } }],
+    null,
+    { signal: controller.signal },
+  )
+
+  await assert.rejects(promise, /too late/)
+  assert.equal(started, 0, 'no task should start under a fired signal')
+  assert.equal(pool.workerQueue.length, 2, 'no slot was ever taken')
+})
+
+test('aborting mid-run drops queued tasks and rejects with the reason', async () => {
+  const pool = new WorkerPool(1)
+  const controller = new AbortController()
+
+  let release
+  const held = new Promise((resolve) => { release = resolve })
+  const ran = []
+  const task = (id) => async () => {
+    ran.push(id)
+    if (id === 0) await held
+    return { worker: stubWorker(), result: id }
+  }
+
+  const { promise } = pool.runTasks(
+    [task(0), task(1), task(2)],
+    null,
+    { signal: controller.signal },
+  )
+  await waitFor(() => ran.length === 1, 'the first task should start')
+
+  controller.abort(new Error('view changed'))
+  await assert.rejects(promise, /view changed/)
+
+  // The in-flight task settles into the torn-down run; its slot still comes back.
+  release()
+  await waitFor(() => pool.workerQueue.length === 1, 'the straggler kept its slot')
+
+  // Give any stray dispatch a chance to run before asserting it did not.
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  assert.deepEqual(ran, [0], 'the queued tasks were dropped, not started')
+})
+
+test('a signal that fires after the batch settled is inert', async () => {
+  const unhandled = []
+  const onUnhandled = (reason) => unhandled.push(reason)
+  process.on('unhandledRejection', onUnhandled)
+
+  const pool = new WorkerPool(1)
+  const controller = new AbortController()
+  try {
+    const { promise } = pool.runTasks(
+      [async () => ({ worker: stubWorker(), result: 7 })],
+      null,
+      { signal: controller.signal },
+    )
+    assert.deepEqual(await promise, [7])
+
+    // The listener was detached when the run settled, so this lands nowhere.
+    controller.abort(new Error('after the fact'))
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    assert.deepEqual(unhandled, [])
+    assert.equal(pool.workerQueue.length, 1)
+  } finally {
+    process.off('unhandledRejection', onUnhandled)
+  }
+})
+
+// A batch with no free slot and nothing of its own running parks its task on a
+// 50ms retry timer. When the abort lands while the task is parked, the retry
+// fires into a run that has already been torn down — the task must be dropped
+// there, not started against a settled batch.
+test('a task parked on the retry timer when the abort lands never starts', { timeout: 10_000 }, async () => {
+  const pool = new WorkerPool(1)
+  const stub = stubWorker()
+
+  let release
+  const held = new Promise((resolve) => { release = resolve })
+  const first = pool.runTasks([
+    async () => { await held; return { worker: stub, result: 1 } },
+  ]).promise
+
+  // No slot free, nothing of batch 2's running: its task postpones.
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  const controller = new AbortController()
+  let ran = false
+  const second = pool.runTasks(
+    [async () => { ran = true; return { worker: stubWorker(), result: 2 } }],
+    null,
+    { signal: controller.signal },
+  ).promise
+
+  controller.abort(new Error('gone'))
+  await assert.rejects(second, /gone/)
+
+  release()
+  assert.deepEqual(await first, [1])
+
+  // Let the 50ms retry fire into the cleared run before asserting.
+  await new Promise((resolve) => setTimeout(resolve, 120))
+  assert.equal(ran, false, 'the parked task never started')
+  assert.equal(pool.workerQueue.length, 1, 'the pool kept its slot')
+})
+
 test('an error thrown inside the worker rejects the request', { timeout: 10_000 }, async () => {
   const worker = createWorker(SQUARE_WORKER)
   try {
