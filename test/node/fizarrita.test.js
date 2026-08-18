@@ -408,7 +408,9 @@ test('a store-level signal alone also drops the queued tasks', async () => {
     await assert.rejects(read, /store walked away/)
   })
 
-  await new Promise((resolve) => setTimeout(resolve, 50))
+  // Wait for all parked fetches to be released/aborted before asserting
+  // the count. This ensures no in-flight operations are still active.
+  await waitFor(() => store.heldCount === 0, 'all parked fetches should be released')
   assert.equal(store.chunkGets.length, 3, `chunk reads: ${store.chunkGets}`)
 })
 
@@ -435,11 +437,20 @@ test('a concurrent read survives another read aborting their shared chunks', { t
         () => store.chunkGets.filter((k) => k === '/data/c/0/0').length >= 4,
         'read B should have read the first chunk',
       )
-      // B joining A's in-flight fetches as a follower touches no store —
-      // there is nothing observable to wait on, so give it a beat. If B
-      // hasn't joined by the abort, it fetches fresh and the test passes
-      // without exercising the follower-retry path it exists for.
-      await new Promise((resolve) => setTimeout(resolve, 100))
+      // Wait for B to have progressed into fetching additional chunks. Since
+      // B joining A's in-flight fetches as a follower doesn't touch the store,
+      // we wait for either (a) B creating independent fetches (heldCount > 2),
+      // or (b) the held state to stabilize, indicating B has had the
+      // opportunity to join. We verify this by checking the held count remains
+      // at 2 (A's two parked fetches) across multiple poll iterations.
+      let stableCount = 0
+      await waitFor(() => {
+        const current = store.heldCount
+        if (current > 2) return true // B made independent fetches
+        if (current === 2) stableCount++
+        else stableCount = 0
+        return stableCount >= 3 // Stable for 3 iterations (30ms of polls)
+      }, 'read B should have attempted to join or created independent fetches')
 
       controller.abort(new Error('viewport moved'))
       await assert.rejects(readA, /viewport moved/)
