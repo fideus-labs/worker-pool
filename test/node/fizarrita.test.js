@@ -389,6 +389,29 @@ test('aborting mid-read cancels the in-flight fetch and drops the queued ones', 
   assert.equal(store.chunkGets.length, 3, `chunk reads: ${store.chunkGets}`)
 })
 
+// A signal supplied only at the store level (inside `opts.opts`) gets the
+// same treatment as `opts.signal`: the pool runs under the combined signal,
+// so queued tasks are dropped rather than dispatched into failing fetches.
+test('a store-level signal alone also drops the queued tasks', async () => {
+  const { store, arr } = await makeAbortableArray()
+  store.hold = (key) => key.startsWith('/data/c/') && key !== '/data/c/0/0'
+
+  await withPool(1, async (pool) => {
+    const controller = new AbortController()
+    const read = getWorker(arr, null, {
+      pool,
+      opts: { signal: controller.signal },
+    })
+
+    await waitFor(() => store.heldCount === 1, 'a chunk fetch should be parked')
+    controller.abort(new Error('store walked away'))
+    await assert.rejects(read, /store walked away/)
+  })
+
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  assert.equal(store.chunkGets.length, 3, `chunk reads: ${store.chunkGets}`)
+})
+
 // Concurrent reads of the same chunks share one fetch, and that fetch runs
 // with its producer's signal. A read that did not abort must survive its
 // producer walking away — by re-fetching the chunk itself — even when the
@@ -409,9 +432,13 @@ test('a concurrent read survives another read aborting their shared chunks', { t
       // B re-reads the unparked first chunk itself (A's share of it has long
       // settled), then joins A's parked in-flight fetches as a follower.
       await waitFor(
-        () => store.chunkGets.filter((k) => k === '/data/c/0/0').length === 4,
+        () => store.chunkGets.filter((k) => k === '/data/c/0/0').length >= 4,
         'read B should have read the first chunk',
       )
+      // B joining A's in-flight fetches as a follower touches no store —
+      // there is nothing observable to wait on, so give it a beat. If B
+      // hasn't joined by the abort, it fetches fresh and the test passes
+      // without exercising the follower-retry path it exists for.
       await new Promise((resolve) => setTimeout(resolve, 100))
 
       controller.abort(new Error('viewport moved'))

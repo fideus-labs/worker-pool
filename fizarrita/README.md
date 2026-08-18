@@ -148,8 +148,10 @@ dropped rather than started; and the returned promise rejects with the
 signal's reason. A decode already running on a worker is not interrupted —
 its result is discarded.
 
-If `opts` carries its own store-level `signal`, the two are combined: fetches
-abort when either fires. A concurrent `getWorker` call sharing an in-flight
+If `opts` carries its own store-level `signal`, the two are combined: when
+either fires, fetches abort, still-queued tasks are dropped, and the promise
+rejects with the reason of whichever signal fired. A concurrent `getWorker`
+call sharing an in-flight
 chunk fetch with an aborted read is unaffected — it re-fetches the chunk
 under its own signal.
 

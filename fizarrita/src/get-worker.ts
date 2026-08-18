@@ -733,6 +733,31 @@ export async function probeActualChunkShape<
 // ---------------------------------------------------------------------------
 
 /**
+ * Combine two abort signals into one that fires when either does.
+ *
+ * `AbortSignal.any` where available; on runtimes that predate it (Safari
+ * before 17.4, Node before 20.3) a controller bridge. The bridge's listeners
+ * stay on the parent signals for the parents' lifetime — acceptable for
+ * one-shot read signals, which is the only way this module uses them.
+ */
+function combineAbortSignals(a: AbortSignal, b: AbortSignal): AbortSignal {
+  if (typeof AbortSignal.any === "function") {
+    return AbortSignal.any([a, b])
+  }
+  if (a.aborted) return a
+  if (b.aborted) return b
+  const controller = new AbortController()
+  const forward = (signal: AbortSignal) => {
+    signal.addEventListener("abort", () => controller.abort(signal.reason), {
+      once: true,
+    })
+  }
+  forward(a)
+  forward(b)
+  return controller.signal
+}
+
+/**
  * Read data from a zarrita Array with codec decoding offloaded to Web Workers.
  *
  * Drop-in replacement for zarrita's `get()` with worker acceleration.
@@ -794,7 +819,7 @@ export async function getWorker<
     ?.signal
   const fetchSignal =
     signal && storeSignal
-      ? AbortSignal.any([signal, storeSignal])
+      ? combineAbortSignals(signal, storeSignal)
       : (signal ?? storeSignal)
   const storeOpts =
     fetchSignal === storeSignal
@@ -832,8 +857,9 @@ export async function getWorker<
   // reads complete instead of rejecting, and this is the last await before
   // the pool (whose own signal handling covers the rest) — without it, a
   // fully-cached read would return data after its caller already walked away.
-  if (signal?.aborted) {
-    throw signal.reason
+  // Watches the combined signal so a store-level abort is caught too.
+  if (fetchSignal?.aborted) {
+    throw fetchSignal.reason
   }
 
   // Update codecMeta to use the actual chunk shape for codec pipeline
@@ -1043,11 +1069,13 @@ export async function getWorker<
     })
   }
 
-  // Execute all tasks with bounded concurrency via WorkerPool. The signal is
-  // handed to the pool, which drops still-queued tasks when it fires and
-  // rejects the run with the signal's reason.
+  // Execute all tasks with bounded concurrency via WorkerPool. The combined
+  // signal is handed to the pool, which drops still-queued tasks when either
+  // source fires and rejects the run with that signal's reason — with only
+  // `signal`, a store-level abort would leave queued tasks dispatching just
+  // to fail on their own fetches.
   if (tasks.length > 0) {
-    const { promise } = pool.runTasks(tasks, null, { signal })
+    const { promise } = pool.runTasks(tasks, null, { signal: fetchSignal })
     await promise
   }
 

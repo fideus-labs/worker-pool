@@ -196,7 +196,8 @@ export interface GetWorkerOptions<StoreOpts = unknown> {
    * its result is discarded.
    *
    * If `opts` carries its own store-level `signal`, the two are combined:
-   * fetches abort when either fires.
+   * when either fires, fetches abort, still-queued tasks are dropped, and
+   * the promise rejects with the reason of whichever signal fired.
    */
   signal?: AbortSignal
 }
