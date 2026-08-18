@@ -182,6 +182,11 @@ The array metadata read and the chunk-shape probe are memoised per
 (store, array path) — both are immutable for the lifetime of an array — so
 only the first `getWorker` call on an array touches the store for them. A
 repeat read served entirely from a warm cache performs zero store requests.
+Concurrent calls on a cold array share one resolution. Store options in `opts`
+(headers, credentials, …) reach those reads too, with one exception: an
+`AbortSignal` governs only the calling read's wait, never the shared
+resolution — aborting one caller rejects it promptly without failing the others
+that joined it, and the result still lands for the next read.
 
 ### LRU / bounded caches
 

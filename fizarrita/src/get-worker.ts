@@ -831,6 +831,89 @@ const resolvedArrayInfo = new WeakMap<
   Map<string, Promise<{ info: ArrayMetadata; conclusive: boolean }>>
 >()
 
+function isAbortSignal(value: unknown): value is AbortSignal {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as AbortSignal).aborted === "boolean" &&
+    typeof (value as AbortSignal).addEventListener === "function"
+  )
+}
+
+/**
+ * Split a caller's store options into what a *shared* store request may carry
+ * and the caller's own `AbortSignal`, if the options hold one.
+ *
+ * Everything else — headers, credentials, cache mode — describes how to talk
+ * to the store and is the same for every caller of the same store, so it can
+ * safely govern a request made on behalf of all of them. A signal is the one
+ * option that belongs to a single caller: it says "I no longer want this",
+ * which is not a statement the others have made.
+ *
+ * Only a real signal is separated. Options with no `signal`, or one that is
+ * not an `AbortSignal`, are passed through untouched — same object, no copy.
+ */
+function separateSignal<Opts>(storeOpts: Opts): {
+  shared: Opts
+  signal: AbortSignal | undefined
+} {
+  if (storeOpts && typeof storeOpts === "object" && "signal" in storeOpts) {
+    const { signal, ...shared } = storeOpts as Opts & { signal?: unknown }
+    if (isAbortSignal(signal)) {
+      return { shared: shared as Opts, signal }
+    }
+  }
+  return { shared: storeOpts, signal: undefined }
+}
+
+/**
+ * Settle as `promise` does, unless `signal` aborts first — then reject with
+ * the abort reason, exactly as a fetch given that signal would. `promise`
+ * itself is untouched and keeps running for whoever else awaits it.
+ */
+function untilAborted<T>(
+  promise: Promise<T>,
+  signal: AbortSignal | undefined,
+): Promise<T> {
+  if (!signal) return promise
+  const reason = () =>
+    signal.reason ?? new DOMException("The operation was aborted.", "AbortError")
+  if (signal.aborted) return Promise.reject(reason())
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(reason())
+    signal.addEventListener("abort", onAbort, { once: true })
+    const settled = () => signal.removeEventListener("abort", onAbort)
+    promise.then(
+      (value) => {
+        settled()
+        resolve(value)
+      },
+      (error) => {
+        settled()
+        reject(error)
+      },
+    )
+  })
+}
+
+/**
+ * A private copy of a memoised entry for one caller. `codecMeta` is plain
+ * JSON data (that is what {@link getMetaId} relies on), so a structured clone
+ * is a faithful deep copy; the key encoder is a stateless closure and is
+ * shared. Nothing the caller does to the copy can reach the memo, or the next
+ * caller — and nothing the memo holds is anyone else's object either: the
+ * entry itself is built from a clone (see {@link resolveArrayInfo}), because
+ * the v2 metadata path hands back zarrita's own `arr.chunks` array by
+ * reference.
+ */
+function detach(info: ArrayMetadata): ArrayMetadata {
+  return {
+    codecMeta: structuredClone(info.codecMeta),
+    encodeChunkKey: info.encodeChunkKey,
+    fillValue: structuredClone(info.fillValue),
+  }
+}
+
 /**
  * Read array metadata and probe the actual chunk shape, once per
  * (store, array path) — repeat calls return the memoised promise without
@@ -838,13 +921,22 @@ const resolvedArrayInfo = new WeakMap<
  *
  * The returned metadata's `codecMeta.chunk_shape` already carries the probe's
  * correction, so it describes the chunks as stored, not as the metadata
- * claimed.
+ * claimed. Each caller receives its own copy; the memoised entry is private
+ * to this module and cannot be reached, or altered, through a returned value.
  *
  * `storeOpts` is forwarded to every store read the resolution makes — both the
- * metadata reads and the shape probe — but only on the call that actually
- * performs it: a later caller hitting the memoised promise contributes no
- * store request for its own options to govern. An AbortSignal therefore aborts
- * the resolution it started, not one already in flight for someone else.
+ * metadata reads and the shape probe — with one exception: an `AbortSignal` in
+ * the options is not. The resolution is a shared, memoised resource whose
+ * result outlives every caller that wanted it, so it runs on the options that
+ * are the same for all of them (headers, credentials, and so on) and cannot be
+ * cancelled by any one of them. A caller's signal governs *its own wait*
+ * instead: aborting rejects that caller promptly with the signal's reason,
+ * while the callers sharing the resolution — and the memo — still get their
+ * result. Binding the shared request to whichever caller happened to start it
+ * would let one aborted tile fail every other tile that joined it, or hand
+ * them the fallback chunk shape for a probe *they* never aborted. The cost is
+ * that a resolution nobody wants any more still completes; since the next
+ * caller on the array is served from it, that is rarely wasted.
  *
  * Two outcomes are deliberately *not* kept. A rejected resolution is evicted,
  * so a transient store failure is retried by the next call instead of becoming
@@ -859,43 +951,49 @@ export function resolveArrayInfo<D extends DataType, Store extends Readable>(
   arr: ZarrArray<D, Store>,
   storeOpts?: Parameters<Store["get"]>[1],
 ): Promise<ArrayMetadata> {
+  const { shared, signal } = separateSignal(storeOpts)
+
   let infoByPath = resolvedArrayInfo.get(arr.store)
   if (!infoByPath) {
     infoByPath = new Map()
     resolvedArrayInfo.set(arr.store, infoByPath)
   }
   const memoised = infoByPath.get(arr.path)
-  if (memoised) return memoised.then(({ info }) => info)
+  if (memoised) {
+    return untilAborted(
+      memoised.then(({ info }) => detach(info)),
+      signal,
+    )
+  }
 
   const promise = (async () => {
     const { codecMeta, encodeChunkKey, fillValue } = await readArrayMetadata(
       arr,
-      storeOpts,
+      shared,
     )
     const Ctr = get_ctr(arr.dtype)
     const bytesPerElement = (Ctr as unknown as { BYTES_PER_ELEMENT: number })
       .BYTES_PER_ELEMENT
-    // The probe's fetches run under `storeOpts`, so its abort detection has
-    // to watch the same signal — otherwise its catch-alls would swallow an
-    // abort as a store failure and hand back the fallback shape.
-    const signal = (storeOpts as { signal?: AbortSignal } | undefined)?.signal
+    // No signal for the probe to watch: its fetches run under `shared`, which
+    // carries none — the caller's signal governs the caller's wait (below),
+    // never the shared resolution.
     const { shape, conclusive } = await probeChunkShape(
       arr,
       encodeChunkKey,
       codecMeta,
       bytesPerElement,
-      storeOpts,
-      signal,
+      shared,
     )
     return {
-      info: {
+      // Cloned so the memo owns its data outright — see detach.
+      info: detach({
         codecMeta:
           shape !== codecMeta.chunk_shape
             ? { ...codecMeta, chunk_shape: shape }
             : codecMeta,
         encodeChunkKey,
         fillValue,
-      },
+      }),
       conclusive,
     }
   })()
@@ -913,7 +1011,10 @@ export function resolveArrayInfo<D extends DataType, Store extends Readable>(
     if (!conclusive) forget()
   }, forget)
 
-  return promise.then(({ info }) => info)
+  return untilAborted(
+    promise.then(({ info }) => detach(info)),
+    signal,
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,8 +1123,8 @@ export async function getWorker<
   // only the first call on an array pays the store round-trips, so repeat
   // reads served from a warm chunk cache never touch the store at all.
   // codecMeta.chunk_shape is already the probed (possibly corrected) shape.
-  // Runs under `storeOpts`, so the store reads it makes carry the combined
-  // signal.
+  // Given `storeOpts`, so the combined signal governs *this call's wait* on
+  // the resolution — the resolution itself is shared and runs signal-free.
   const { codecMeta, encodeChunkKey, fillValue } = await resolveArrayInfo(
     arr,
     storeOpts,

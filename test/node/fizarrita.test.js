@@ -15,6 +15,7 @@ import {
   createDefaultWorker,
   DEFAULT_WORKER_URL,
   getWorker,
+  resolveArrayInfo,
   setWorker,
 } from '../../fizarrita/dist/index.js'
 
@@ -596,9 +597,176 @@ test('store options reach the metadata reads, not just the probe', async () => {
 
   // The metadata read used to be the one store request that silently dropped
   // the caller's options while the probe and chunk fetches honoured them.
+  // Same object, not a copy: options without a signal are passed through as-is.
   assert.equal(seenOpts.get('/data/zarr.json'), marker)
   assert.equal(seenOpts.get('/data/c/0/0'), marker)
   assert.equal(seenOpts.get('/data/c/1/1'), marker)
+})
+
+/**
+ * A store whose reads honour `opts.signal` the way fetch does — rejecting
+ * with the signal's reason, including mid-flight — and which, once `hold(re)`
+ * is called, does not complete reads of paths matching `re` until `release()`.
+ * Lets a test hold a resolution open, act while it is in flight, then let it
+ * finish. Armed after setup so zarrita's own reads are never parked.
+ */
+class GatedStore extends CountingStore {
+  #gate = null
+  #open
+  #release
+  constructor() {
+    super()
+    this.#open = new Promise((resolve) => {
+      this.#release = resolve
+    })
+  }
+  hold(gate) {
+    this.#gate = gate
+  }
+  release() {
+    this.#release()
+  }
+  get(key, opts) {
+    const signal = opts?.signal
+    const bytes = super.get(key)
+    return new Promise((resolve, reject) => {
+      if (signal?.aborted) return reject(signal.reason)
+      signal?.addEventListener('abort', () => reject(signal.reason), {
+        once: true,
+      })
+      const wait = this.#gate?.test(key) ? this.#open : Promise.resolve()
+      wait.then(() => resolve(bytes))
+    })
+  }
+}
+
+/** Populate 8x8 int32 0..63 at `/data` on `store`, chunked `chunk_shape`. */
+async function populate(store, chunk_shape) {
+  const arr = await zarr.create(zarr.root(store).resolve('/data'), {
+    shape: [8, 8],
+    chunk_shape,
+    data_type: 'int32',
+  })
+  const expected = Int32Array.from({ length: 64 }, (_, i) => i)
+  await zarr.set(arr, null, { data: expected, shape: [8, 8], stride: [8, 1] })
+  return { arr, expected }
+}
+
+test('aborting one caller does not fail the callers sharing its metadata resolution', async () => {
+  // Hold the zarr.json read open so both callers are in flight on one
+  // resolution when the first one aborts.
+  const store = new GatedStore()
+  const { arr, expected } = await populate(store, [4, 4])
+  store.hold(/zarr\.json$/)
+
+  await withPool(2, async (pool) => {
+    const first = new AbortController()
+    const second = new AbortController()
+    const a = getWorker(arr, null, { pool, opts: { signal: first.signal } })
+    const b = getWorker(arr, null, { pool, opts: { signal: second.signal } })
+    // Let both reach the store before pulling the plug on the first.
+    await new Promise((r) => setTimeout(r, 20))
+    first.abort()
+
+    // The aborter is rejected promptly with its own reason — the shared read
+    // is still parked behind the gate at this point.
+    await assert.rejects(a, (err) => err?.name === 'AbortError')
+
+    store.release()
+    // The other caller neither aborted nor failed: it gets its data.
+    const result = await b
+    assert.deepEqual(Array.from(result.data), Array.from(expected))
+    // And the resolution really was shared — one metadata read for both.
+    const metadataReads = store.reads.filter((k) => k === '/data/zarr.json')
+    assert.equal(metadataReads.length, 1)
+  })
+})
+
+test('aborting one caller does not hand the callers sharing its probe an unprobed chunk shape', async () => {
+  // Chunks are really 4x8; the metadata is rewritten to claim 4x4, so the
+  // probe's correction is load-bearing. Hold the probe's chunk read open.
+  const store = new GatedStore()
+  const { expected } = await populate(store, [4, 8])
+  const meta = JSON.parse(
+    new TextDecoder().decode(await store.get('/data/zarr.json')),
+  )
+  meta.chunk_grid.configuration.chunk_shape = [4, 4]
+  store.set('/data/zarr.json', new TextEncoder().encode(JSON.stringify(meta)))
+  const misdeclared = await zarr.open(zarr.root(store).resolve('/data'), {
+    kind: 'array',
+  })
+  store.hold(/\/c\/0\/0$/)
+
+  await withPool(2, async (pool) => {
+    const first = new AbortController()
+    const a = getWorker(misdeclared, null, { pool, opts: { signal: first.signal } })
+    const b = getWorker(misdeclared, null, { pool })
+    await new Promise((r) => setTimeout(r, 20))
+    first.abort()
+    await assert.rejects(a, (err) => err?.name === 'AbortError')
+
+    store.release()
+    // Had the aborter's signal governed the shared probe, the probe would have
+    // swallowed the abort and fallen back to the declared 4x4 for everyone —
+    // and this read would come back at the wrong shape.
+    const result = await b
+    assert.deepEqual(result.shape, [8, 8])
+    assert.deepEqual(Array.from(result.data), Array.from(expected))
+  })
+})
+
+test('a lone caller that aborts is rejected promptly, and the resolution still lands for the next one', async () => {
+  const store = new GatedStore()
+  const { arr, expected } = await populate(store, [4, 4])
+  store.hold(/zarr\.json$/)
+
+  await withPool(2, async (pool) => {
+    const controller = new AbortController()
+    const a = getWorker(arr, null, { pool, opts: { signal: controller.signal } })
+    await new Promise((r) => setTimeout(r, 20))
+    controller.abort()
+    // Rejected while the store is still gated: the abort did not wait for the
+    // shared read to finish.
+    await assert.rejects(a, (err) => err?.name === 'AbortError')
+
+    store.release()
+    // The resolution completed on its own and was memoised: the next caller
+    // pays no metadata read at all.
+    await new Promise((r) => setTimeout(r, 20))
+    store.reads.length = 0
+    const result = await getWorker(arr, null, { pool })
+    assert.deepEqual(Array.from(result.data), Array.from(expected))
+    assert.ok(!store.reads.includes('/data/zarr.json'), store.reads.join(', '))
+  })
+})
+
+test('resolveArrayInfo hands out copies — mutating one cannot reach the memo or other callers', async () => {
+  const { store, arr } = await makeCountedArray()
+
+  const first = await resolveArrayInfo(arr)
+  // Vandalise everything a caller could reach.
+  first.codecMeta.chunk_shape[0] = 999
+  first.codecMeta.chunk_shape.push(1)
+  first.codecMeta.codecs.push({ name: 'bogus', configuration: {} })
+  first.codecMeta.data_type = 'float64'
+
+  const second = await resolveArrayInfo(arr)
+  assert.notEqual(second.codecMeta, first.codecMeta)
+  assert.deepEqual(second.codecMeta.chunk_shape, [4, 4])
+  assert.deepEqual(second.codecMeta.codecs, [])
+  assert.equal(second.codecMeta.data_type, 'int32')
+
+  // zarrita's own metadata is untouched too — the memo aliases nobody's data.
+  assert.deepEqual(arr.chunks, [4, 4])
+
+  // And a read after the vandalism decodes as it should.
+  await withPool(2, async (pool) => {
+    store.reads.length = 0
+    const result = await getWorker(arr, null, { pool })
+    assert.deepEqual(result.shape, [8, 8])
+    assert.equal(result.data[63], 63)
+    assert.ok(!store.reads.includes('/data/zarr.json'), 'still memoised')
+  })
 })
 
 test('a probe that fails transiently is retried, not memoised as a missed correction', async () => {
