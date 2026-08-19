@@ -870,6 +870,11 @@ function separateSignal<Opts>(storeOpts: Opts): {
  * Settle as `promise` does, unless `signal` aborts first — then reject with
  * the abort reason, exactly as a fetch given that signal would. `promise`
  * itself is untouched and keeps running for whoever else awaits it.
+ *
+ * Whatever the outcome, `promise` is observed here: once the caller has been
+ * rejected on the signal's account, this is the only place still watching
+ * the promise it was handed, and a promise that later rejects with nobody
+ * watching is an unhandled rejection — fatal under Node's default.
  */
 function untilAborted<T>(
   promise: Promise<T>,
@@ -878,7 +883,13 @@ function untilAborted<T>(
   if (!signal) return promise
   const reason = () =>
     signal.reason ?? new DOMException("The operation was aborted.", "AbortError")
-  if (signal.aborted) return Promise.reject(reason())
+  if (signal.aborted) {
+    // The caller never sees `promise` — a fresh derived promise at both call
+    // sites — so absorb its outcome rather than leave a rejection unhandled.
+    // Other observers of the same chain are unaffected by this.
+    promise.catch(() => {})
+    return Promise.reject(reason())
+  }
   return new Promise<T>((resolve, reject) => {
     const onAbort = () => reject(reason())
     signal.addEventListener("abort", onAbort, { once: true })

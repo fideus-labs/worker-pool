@@ -751,6 +751,55 @@ test('a lone caller that aborts is rejected promptly, and the resolution still l
   })
 })
 
+test('a caller that had already aborted leaves no unhandled rejection behind when the resolution it declined then fails', async () => {
+  const store = new GatedStore()
+  const { arr, expected } = await populate(store, [4, 4])
+  store.hold(/zarr\.json$/)
+  // Once released, the metadata read fails — once. The resolution the aborted
+  // caller declined is the one that fails; the read after it succeeds.
+  let failures = 1
+  const gatedGet = store.get.bind(store)
+  store.get = (key, opts) =>
+    gatedGet(key, opts).then((bytes) => {
+      if (key.endsWith('zarr.json') && failures > 0) {
+        failures--
+        throw new Error('transient store failure')
+      }
+      return bytes
+    })
+
+  const unhandled = []
+  const onUnhandled = (reason) => unhandled.push(reason)
+  process.on('unhandledRejection', onUnhandled)
+  try {
+    await withPool(1, async (pool) => {
+      // A store-level signal is not pre-checked by getWorker the way
+      // `opts.signal` is: it reaches resolveArrayInfo already aborted, and the
+      // caller is rejected on the spot — while the shared read is still parked.
+      const controller = new AbortController()
+      controller.abort(new Error('gone before it began'))
+      await assert.rejects(
+        getWorker(arr, null, { pool, opts: { signal: controller.signal } }),
+        /gone before it began/,
+      )
+      await store.entered
+
+      // Nobody is waiting on that resolution any more. Let it fail now, and
+      // give the runtime a turn to report a rejection nobody handled.
+      store.release()
+      await new Promise((r) => setImmediate(r))
+      await new Promise((r) => setImmediate(r))
+      assert.deepEqual(unhandled, [], 'a declined resolution failed unobserved')
+
+      // The failure was not memoised either: the next read resolves afresh.
+      const result = await getWorker(arr, null, { pool })
+      assert.deepEqual(Array.from(result.data), Array.from(expected))
+    })
+  } finally {
+    process.off('unhandledRejection', onUnhandled)
+  }
+})
+
 test('resolveArrayInfo hands out copies — mutating one cannot reach the memo or other callers', async () => {
   const { store, arr } = await makeCountedArray()
 
