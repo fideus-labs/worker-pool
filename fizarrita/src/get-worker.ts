@@ -151,6 +151,15 @@ export interface ArrayMetadata {
   fillValue: Scalar<DataType> | null
 }
 
+/**
+ * Read a zarr array's metadata, trying v3 (`zarr.json`) then v2 (`.zarray`).
+ *
+ * `storeOpts` is forwarded to every `store.get` this makes, so an AbortSignal,
+ * auth header, or any other per-request option governs the metadata reads on
+ * the same terms as the chunk reads that follow them — a signal that aborts
+ * the chunk fetches but silently leaves the `zarr.json` read running would be
+ * a surprising asymmetry.
+ */
 export async function readArrayMetadata<
   D extends DataType,
   Store extends Readable,
@@ -575,8 +584,10 @@ export function inferChunkShape(
  * candidate's chunks are too large (the real grid has more chunks in that
  * dimension) and should be rejected.
  *
- * Returns true if the candidate is valid (probe returned 404/empty),
- * false if invalid (probe returned data, meaning chunks are too coarse).
+ * `valid` is true if the candidate holds (probe returned 404/empty), false if
+ * invalid (probe returned data, meaning chunks are too coarse). `conclusive`
+ * is false when the answer came from a swallowed fetch error rather than from
+ * a completed probe — see {@link ChunkShapeProbe}.
  */
 async function validateCandidateChunkShape<
   D extends DataType,
@@ -587,7 +598,7 @@ async function validateCandidateChunkShape<
   candidate: number[],
   storeOpts?: Parameters<Store["get"]>[1],
   signal?: AbortSignal,
-): Promise<boolean> {
+): Promise<{ valid: boolean; conclusive: boolean }> {
   const ndim = candidate.length
 
   // Compute grid dimensions and find the dimension with the smallest extent > 1
@@ -607,8 +618,10 @@ async function validateCandidateChunkShape<
   }
 
   if (probeDim === -1) {
-    // All dimensions have only 1 chunk — can't validate, assume correct
-    return true
+    // All dimensions have only 1 chunk — can't validate, assume correct.
+    // Conclusive: this answer is a property of the grid, not of a failed
+    // request, so it will be the same on every retry.
+    return { valid: true, conclusive: true }
   }
 
   // Probe one-past-the-end: if the store has a chunk at this coordinate,
@@ -621,12 +634,14 @@ async function validateCandidateChunkShape<
   try {
     const probeBytes = await arr.store.get(probePath, storeOpts)
     // If data returned, there's a chunk beyond our expected grid → reject
-    return !probeBytes
+    return { valid: !probeBytes, conclusive: true }
   } catch (error) {
     // A caller abort is not a probe outcome — the whole read is over.
     if (signal?.aborted) throw error
-    // Fetch error (404, network error) → no chunk there → accept
-    return true
+    // Fetch error (404, network error) → no chunk there → accept. The two are
+    // indistinguishable here, so the acceptance is a guess made under an
+    // error and must not be memoised as settled.
+    return { valid: true, conclusive: false }
   }
 }
 
@@ -658,6 +673,52 @@ export async function probeActualChunkShape<
   storeOpts?: Parameters<Store["get"]>[1],
   signal?: AbortSignal,
 ): Promise<number[]> {
+  const { shape } = await probeChunkShape(
+    arr,
+    encodeChunkKey,
+    codecMeta,
+    bytesPerElement,
+    storeOpts,
+    signal,
+  )
+  return shape
+}
+
+/**
+ * A probed chunk shape, plus whether the probe actually concluded it.
+ *
+ * `conclusive` is false when the shape is what the probe fell back to after
+ * swallowing a store failure — a fetch that threw — rather than what it read
+ * from the data. (An abort of the `signal` the probe was given to watch is not
+ * swallowed at all: it propagates and ends the read.)
+ *
+ * The distinction exists because {@link resolveArrayInfo} memoises the result.
+ * Swallowing the failure is right for a single read: the probe is a heuristic
+ * correction, and failing a whole read because a *heuristic* could not fetch
+ * `c/0/0` would break reads of arrays whose first chunk merely happens to be
+ * unreachable. But an inconclusive answer must not outlive the call that made
+ * it. Before memoisation each read re-probed, so a transient blip cost one
+ * uncorrected read and healed itself; cached forever, that same blip leaves a
+ * mis-declared array decoding at the wrong shape for the lifetime of the
+ * store. So the fallback still returns — and is then refused a cache entry.
+ */
+interface ChunkShapeProbe {
+  shape: number[]
+  conclusive: boolean
+}
+
+/**
+ * {@link probeActualChunkShape}, reporting whether the answer was concluded
+ * from data or fallen back to after a store failure.
+ */
+async function probeChunkShape<D extends DataType, Store extends Readable>(
+  arr: ZarrArray<D, Store>,
+  encodeChunkKey: (chunk_coords: number[]) => string,
+  codecMeta: CodecChunkMeta,
+  bytesPerElement: number,
+  storeOpts?: Parameters<Store["get"]>[1],
+  signal?: AbortSignal,
+): Promise<ChunkShapeProbe> {
   const metadataChunkShape = codecMeta.chunk_shape
   const metaElements = metadataChunkShape.reduce((a, b) => a * b, 1)
 
@@ -666,9 +727,11 @@ export async function probeActualChunkShape<
   const chunkKey = encodeChunkKey(zeroCoords)
   const chunkPath = arr.resolve(chunkKey).path
 
+  // Every early return below is conclusive: each is a determination made from
+  // bytes actually read, so re-probing would reach the same answer.
   try {
     const rawBytes = await arr.store.get(chunkPath, storeOpts)
-    if (!rawBytes) return metadataChunkShape
+    if (!rawBytes) return { shape: metadataChunkShape, conclusive: true }
 
     // Determine decompressed size via hybrid strategy
     const decompressedBytes = await probeDecompressedSize(
@@ -676,10 +739,14 @@ export async function probeActualChunkShape<
       codecMeta,
       bytesPerElement,
     )
-    if (decompressedBytes == null) return metadataChunkShape
+    if (decompressedBytes == null) {
+      return { shape: metadataChunkShape, conclusive: true }
+    }
 
     const actualElements = decompressedBytes / bytesPerElement
-    if (actualElements === metaElements) return metadataChunkShape
+    if (actualElements === metaElements) {
+      return { shape: metadataChunkShape, conclusive: true }
+    }
 
     // Mismatch detected — infer chunk shape from element count + heuristics
     const candidates = inferChunkShape(
@@ -687,28 +754,35 @@ export async function probeActualChunkShape<
       metadataChunkShape,
       arr.shape,
     )
-    if (candidates.length === 0) return metadataChunkShape
+    if (candidates.length === 0) {
+      return { shape: metadataChunkShape, conclusive: true }
+    }
 
     // Validate candidates by probing one-past-the-end.
     // The first candidate that passes validation wins.
     // Limit validation attempts to avoid excessive network requests.
+    // A candidate accepted because its validation probe *failed* rather than
+    // came back empty taints the result: the choice was a guess, so it is
+    // returned but not treated as settled.
+    let conclusive = true
     const maxValidationAttempts = Math.min(candidates.length, 5)
     for (let i = 0; i < maxValidationAttempts; i++) {
       const candidate = candidates[i]
-      const isValid = await validateCandidateChunkShape(
+      const validation = await validateCandidateChunkShape(
         arr,
         encodeChunkKey,
         candidate,
         storeOpts,
         signal,
       )
-      if (isValid) {
+      if (!validation.conclusive) conclusive = false
+      if (validation.valid) {
         console.warn(
           `[fizarrita] Metadata chunk_shape ${JSON.stringify(metadataChunkShape)} ` +
             `does not match actual chunk data (${actualElements} elements). ` +
             `Using inferred chunk_shape: ${JSON.stringify(candidate)}`,
         )
-        return candidate
+        return { shape: candidate, conclusive }
       }
     }
 
@@ -719,13 +793,239 @@ export async function probeActualChunkShape<
         `does not match actual chunk data (${actualElements} elements). ` +
         `Using inferred chunk_shape: ${JSON.stringify(fallback)} (unvalidated)`,
     )
-    return fallback
+    return { shape: fallback, conclusive }
   } catch (error) {
     // The catch-all exists to degrade gracefully when the probe fetch fails;
     // a caller abort is not that — it has to stop the whole read.
     if (signal?.aborted) throw error
-    return metadataChunkShape
+    // A store failure, not a determination — see ChunkShapeProbe.
+    return { shape: metadataChunkShape, conclusive: false }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Per-array resolution — metadata read + chunk-shape probe, memoised
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolved array info per store, keyed by array path.
+ *
+ * Both the array metadata and the probed chunk shape are immutable for the
+ * lifetime of an array, but resolving them costs store round-trips: one read
+ * of `zarr.json` (two, when falling back to v2), one chunk read for the probe,
+ * and up to five one-past-the-end probes on a mismatch. Without memoisation
+ * every `getWorker` call pays them *before* the chunk cache is consulted, so a
+ * fully populated cache cannot eliminate them — for a tiled viewer that is
+ * per-tile overhead scaling with pan/zoom activity rather than with cache
+ * misses.
+ *
+ * Keyed on the store instance (a WeakMap, so entries die with the store) plus
+ * the array path, mirroring the chunk-cache key of {@link createCacheKey}, so
+ * distinct `zarr.open` handles onto the same array share one entry.
+ *
+ * The promise is memoised, not the value, so concurrent `getWorker` calls on a
+ * cold array share one resolution instead of racing store reads.
+ */
+const resolvedArrayInfo = new WeakMap<
+  object,
+  Map<string, Promise<{ info: ArrayMetadata; conclusive: boolean }>>
+>()
+
+function isAbortSignal(value: unknown): value is AbortSignal {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof (value as AbortSignal).aborted === "boolean" &&
+    typeof (value as AbortSignal).addEventListener === "function"
+  )
+}
+
+/**
+ * Split a caller's store options into what a *shared* store request may carry
+ * and the caller's own `AbortSignal`, if the options hold one.
+ *
+ * Everything else — headers, credentials, cache mode — describes how to talk
+ * to the store and is the same for every caller of the same store, so it can
+ * safely govern a request made on behalf of all of them. A signal is the one
+ * option that belongs to a single caller: it says "I no longer want this",
+ * which is not a statement the others have made.
+ *
+ * Only a real signal is separated. Options with no `signal`, or one that is
+ * not an `AbortSignal`, are passed through untouched — same object, no copy.
+ */
+function separateSignal<Opts>(storeOpts: Opts): {
+  shared: Opts
+  signal: AbortSignal | undefined
+} {
+  if (storeOpts && typeof storeOpts === "object" && "signal" in storeOpts) {
+    const { signal, ...shared } = storeOpts as Opts & { signal?: unknown }
+    if (isAbortSignal(signal)) {
+      return { shared: shared as Opts, signal }
+    }
+  }
+  return { shared: storeOpts, signal: undefined }
+}
+
+/**
+ * Settle as `promise` does, unless `signal` aborts first — then reject with
+ * the abort reason, exactly as a fetch given that signal would. `promise`
+ * itself is untouched and keeps running for whoever else awaits it.
+ *
+ * Whatever the outcome, `promise` is observed here: once the caller has been
+ * rejected on the signal's account, this is the only place still watching
+ * the promise it was handed, and a promise that later rejects with nobody
+ * watching is an unhandled rejection — fatal under Node's default.
+ */
+function untilAborted<T>(
+  promise: Promise<T>,
+  signal: AbortSignal | undefined,
+): Promise<T> {
+  if (!signal) return promise
+  const reason = () =>
+    signal.reason ?? new DOMException("The operation was aborted.", "AbortError")
+  if (signal.aborted) {
+    // The caller never sees `promise` — a fresh derived promise at both call
+    // sites — so absorb its outcome rather than leave a rejection unhandled.
+    // Other observers of the same chain are unaffected by this.
+    promise.catch(() => {})
+    return Promise.reject(reason())
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(reason())
+    signal.addEventListener("abort", onAbort, { once: true })
+    const settled = () => signal.removeEventListener("abort", onAbort)
+    promise.then(
+      (value) => {
+        settled()
+        resolve(value)
+      },
+      (error) => {
+        settled()
+        reject(error)
+      },
+    )
+  })
+}
+
+/**
+ * A private copy of a memoised entry for one caller. `codecMeta` is plain
+ * JSON data (that is what {@link getMetaId} relies on), so a structured clone
+ * is a faithful deep copy; the key encoder is a stateless closure and is
+ * shared. Nothing the caller does to the copy can reach the memo, or the next
+ * caller — and nothing the memo holds is anyone else's object either: the
+ * entry itself is built from a clone (see {@link resolveArrayInfo}), because
+ * the v2 metadata path hands back zarrita's own `arr.chunks` array by
+ * reference.
+ */
+function detach(info: ArrayMetadata): ArrayMetadata {
+  return {
+    codecMeta: structuredClone(info.codecMeta),
+    encodeChunkKey: info.encodeChunkKey,
+    fillValue: structuredClone(info.fillValue),
+  }
+}
+
+/**
+ * Read array metadata and probe the actual chunk shape, once per
+ * (store, array path) — repeat calls return the memoised promise without
+ * touching the store.
+ *
+ * The returned metadata's `codecMeta.chunk_shape` already carries the probe's
+ * correction, so it describes the chunks as stored, not as the metadata
+ * claimed. Each caller receives its own copy; the memoised entry is private
+ * to this module and cannot be reached, or altered, through a returned value.
+ *
+ * `storeOpts` is forwarded to every store read the resolution makes — both the
+ * metadata reads and the shape probe — with one exception: an `AbortSignal` in
+ * the options is not. The resolution is a shared, memoised resource whose
+ * result outlives every caller that wanted it, so it runs on the options that
+ * are the same for all of them (headers, credentials, and so on) and cannot be
+ * cancelled by any one of them. A caller's signal governs *its own wait*
+ * instead: aborting rejects that caller promptly with the signal's reason,
+ * while the callers sharing the resolution — and the memo — still get their
+ * result. Binding the shared request to whichever caller happened to start it
+ * would let one aborted tile fail every other tile that joined it, or hand
+ * them the fallback chunk shape for a probe *they* never aborted. The cost is
+ * that a resolution nobody wants any more still completes; since the next
+ * caller on the array is served from it, that is rarely wasted.
+ *
+ * Two outcomes are deliberately *not* kept. A rejected resolution is evicted,
+ * so a transient store failure is retried by the next call instead of becoming
+ * permanent. So is a resolution whose chunk-shape probe was inconclusive — one
+ * that swallowed a store failure and fell back to the declared shape rather
+ * than reading the real one (see {@link ChunkShapeProbe}). Both still serve the
+ * call that produced them, and every caller already waiting on them; they just
+ * do not outlive it. Caching a guess made under an error is how a one-off blip
+ * would otherwise turn into an array that decodes at the wrong shape forever.
+ */
+export function resolveArrayInfo<D extends DataType, Store extends Readable>(
+  arr: ZarrArray<D, Store>,
+  storeOpts?: Parameters<Store["get"]>[1],
+): Promise<ArrayMetadata> {
+  const { shared, signal } = separateSignal(storeOpts)
+
+  let infoByPath = resolvedArrayInfo.get(arr.store)
+  if (!infoByPath) {
+    infoByPath = new Map()
+    resolvedArrayInfo.set(arr.store, infoByPath)
+  }
+  const memoised = infoByPath.get(arr.path)
+  if (memoised) {
+    return untilAborted(
+      memoised.then(({ info }) => detach(info)),
+      signal,
+    )
+  }
+
+  const promise = (async () => {
+    const { codecMeta, encodeChunkKey, fillValue } = await readArrayMetadata(
+      arr,
+      shared,
+    )
+    const Ctr = get_ctr(arr.dtype)
+    const bytesPerElement = (Ctr as unknown as { BYTES_PER_ELEMENT: number })
+      .BYTES_PER_ELEMENT
+    // No signal for the probe to watch: its fetches run under `shared`, which
+    // carries none — the caller's signal governs the caller's wait (below),
+    // never the shared resolution.
+    const { shape, conclusive } = await probeChunkShape(
+      arr,
+      encodeChunkKey,
+      codecMeta,
+      bytesPerElement,
+      shared,
+    )
+    return {
+      // Cloned so the memo owns its data outright — see detach.
+      info: detach({
+        codecMeta:
+          shape !== codecMeta.chunk_shape
+            ? { ...codecMeta, chunk_shape: shape }
+            : codecMeta,
+        encodeChunkKey,
+        fillValue,
+      }),
+      conclusive,
+    }
+  })()
+
+  const paths = infoByPath
+  paths.set(arr.path, promise)
+  // Conditional on the entry still being ours, so a later attempt that already
+  // replaced it is not dropped by our own settlement.
+  const forget = () => {
+    if (paths.get(arr.path) === promise) {
+      paths.delete(arr.path)
+    }
+  }
+  promise.then(({ conclusive }) => {
+    if (!conclusive) forget()
+  }, forget)
+
+  return untilAborted(
+    promise.then(({ info }) => detach(info)),
+    signal,
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -830,8 +1130,13 @@ export async function getWorker<
     assertSharedArrayBufferAvailable()
   }
 
-  // Read metadata from store — single read, single parse
-  const { codecMeta, encodeChunkKey, fillValue } = await readArrayMetadata(
+  // Metadata read + chunk-shape probe, memoised per (store, array path):
+  // only the first call on an array pays the store round-trips, so repeat
+  // reads served from a warm chunk cache never touch the store at all.
+  // codecMeta.chunk_shape is already the probed (possibly corrected) shape.
+  // Given `storeOpts`, so the combined signal governs *this call's wait* on
+  // the resolution — the resolution itself is shared and runs signal-free.
+  const { codecMeta, encodeChunkKey, fillValue } = await resolveArrayInfo(
     arr,
     storeOpts,
   )
@@ -840,42 +1145,25 @@ export async function getWorker<
   const bytesPerElement = (Ctr as unknown as { BYTES_PER_ELEMENT: number })
     .BYTES_PER_ELEMENT
 
-  // Probe actual chunk shape — detects metadata vs data mismatch
-  const actualChunkShape = await probeActualChunkShape(
-    arr,
-    encodeChunkKey,
-    codecMeta,
-    bytesPerElement,
-    storeOpts,
-    // The probe's fetches run under the combined signal, so its abort
-    // detection has to watch the same one — with only `signal`, a store-level
-    // abort would be swallowed by the probe's catch-alls.
-    fetchSignal,
-  )
-
   // Checkpoint for stores that ignore the signal: their metadata and probe
-  // reads complete instead of rejecting, and this is the last await before
-  // the pool (whose own signal handling covers the rest) — without it, a
-  // fully-cached read would return data after its caller already walked away.
-  // Watches the combined signal so a store-level abort is caught too.
+  // reads complete instead of rejecting — and a memoised resolution never
+  // touches the store at all — and this is the last await before the pool
+  // (whose own signal handling covers the rest). Without it, a fully-cached
+  // read would return data after its caller already walked away. Watches the
+  // combined signal so a store-level abort is caught too.
   if (fetchSignal?.aborted) {
     throw fetchSignal.reason
   }
 
-  // Update codecMeta to use the actual chunk shape for codec pipeline
-  const correctedCodecMeta =
-    actualChunkShape !== codecMeta.chunk_shape
-      ? { ...codecMeta, chunk_shape: actualChunkShape }
-      : codecMeta
-
   // Get stable metaId for the codec metadata (used by worker-rpc meta-init)
-  const metaId = getMetaId(correctedCodecMeta)
+  const metaId = getMetaId(codecMeta)
 
   // Set up the indexer with the actual (possibly corrected) chunk shape
+  const chunkShape = codecMeta.chunk_shape
   const indexer = new BasicIndexer({
     selection,
     shape: arr.shape,
-    chunk_shape: actualChunkShape,
+    chunk_shape: chunkShape,
   })
 
   // Allocate output — backed by SharedArrayBuffer when requested
@@ -884,9 +1172,6 @@ export async function getWorker<
   const data = new Ctr(buffer as ArrayBuffer, 0, size)
   const outStride = get_strides(indexer.shape)
   const out = setter.prepare(data, indexer.shape, outStride) as Chunk<D>
-
-  // Pre-compute chunk invariants (hoisted out of loop)
-  const chunkShape = actualChunkShape
 
   // Build tasks — one per chunk
   const tasks: WorkerPoolTask<void>[] = []
@@ -959,7 +1244,7 @@ export async function getWorker<
               worker,
               rawBytes,
               metaId,
-              correctedCodecMeta,
+              codecMeta,
               buffer as SharedArrayBuffer,
               size * bytesPerElement,
               outStride,
@@ -999,7 +1284,7 @@ export async function getWorker<
             worker,
             rawBytes,
             metaId,
-            correctedCodecMeta,
+            codecMeta,
             isEdgeChunk ? edgeChunkShape : undefined,
           )
         } catch (error) {

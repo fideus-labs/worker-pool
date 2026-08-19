@@ -23,6 +23,7 @@ export {
   readArrayMetadata,
   readBloscFrameContentSize,
   readZstdFrameContentSize,
+  resolveArrayInfo,
 } from "./get-worker.js"
 // Internals — exported for building custom workers that extend the codec worker
 export { create_codec_pipeline } from "./internals/codec-pipeline.js"

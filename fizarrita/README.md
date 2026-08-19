@@ -141,12 +141,13 @@ const read = getWorker(arr, [zarr.slice(0, 256), zarr.slice(0, 256)], {
 controller.abort()
 ```
 
-When the signal fires, the signal is forwarded to every `store.get` call, so
-stores that honour it (e.g. `FetchStore`, whose options are a `RequestInit`)
-cancel their network requests; chunk tasks still queued on the pool are
-dropped rather than started; and the returned promise rejects with the
+The signal is passed to each chunk `store.get` call the read makes, so stores
+that honour it (e.g. `FetchStore`, whose options are a `RequestInit`) cancel
+their network requests when it fires. Chunk tasks still queued on the pool are
+dropped rather than started, and the returned promise rejects with the
 signal's reason. A decode already running on a worker is not interrupted —
-its result is discarded.
+its result is discarded. The shared metadata read and chunk-shape probe are
+the one exception — they run without it; see [Chunk caching](#chunk-caching).
 
 If `opts` carries its own store-level `signal`, the two are combined: when
 either fires, fetches abort, still-queued tasks are dropped, and the promise
@@ -177,6 +178,16 @@ const b = await getWorker(arr, null, { pool, cache })
 Cache keys use the format `store_N:/array/path:c/0/1/2`. A `WeakMap`-based
 store ID ensures keys are unique across store instances, so a single cache can
 safely be shared across multiple arrays and stores.
+
+The array metadata read and the chunk-shape probe are memoised per
+(store, array path) — both are immutable for the lifetime of an array — so
+only the first `getWorker` call on an array touches the store for them. A
+repeat read served entirely from a warm cache performs zero store requests.
+Concurrent calls on a cold array share one resolution. Store options in `opts`
+(headers, credentials, …) reach those reads too, with one exception: an
+`AbortSignal` governs only the calling read's wait, never the shared
+resolution — aborting one caller rejects it promptly without failing the others
+that joined it, and the result still lands for the next read.
 
 ### LRU / bounded caches
 
