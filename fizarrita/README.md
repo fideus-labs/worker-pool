@@ -141,12 +141,13 @@ const read = getWorker(arr, [zarr.slice(0, 256), zarr.slice(0, 256)], {
 controller.abort()
 ```
 
-When the signal fires, the signal is forwarded to every `store.get` call, so
-stores that honour it (e.g. `FetchStore`, whose options are a `RequestInit`)
-cancel their network requests; chunk tasks still queued on the pool are
-dropped rather than started; and the returned promise rejects with the
+The signal is passed to each chunk `store.get` call the read makes, so stores
+that honour it (e.g. `FetchStore`, whose options are a `RequestInit`) cancel
+their network requests when it fires. Chunk tasks still queued on the pool are
+dropped rather than started, and the returned promise rejects with the
 signal's reason. A decode already running on a worker is not interrupted —
-its result is discarded.
+its result is discarded. The shared metadata read and chunk-shape probe are
+the one exception — they run without it; see [Chunk caching](#chunk-caching).
 
 If `opts` carries its own store-level `signal`, the two are combined: when
 either fires, fetches abort, still-queued tasks are dropped, and the promise
