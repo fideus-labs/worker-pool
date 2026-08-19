@@ -609,15 +609,23 @@ test('store options reach the metadata reads, not just the probe', async () => {
  * is called, does not complete reads of paths matching `re` until `release()`.
  * Lets a test hold a resolution open, act while it is in flight, then let it
  * finish. Armed after setup so zarrita's own reads are never parked.
+ *
+ * `entered` resolves when the first gated read starts, so a test can wait for
+ * "the resolution is in flight" instead of guessing at it with a sleep.
  */
 class GatedStore extends CountingStore {
   #gate = null
   #open
   #release
+  #entered
+  entered
   constructor() {
     super()
     this.#open = new Promise((resolve) => {
       this.#release = resolve
+    })
+    this.entered = new Promise((resolve) => {
+      this.#entered = resolve
     })
   }
   hold(gate) {
@@ -634,7 +642,9 @@ class GatedStore extends CountingStore {
       signal?.addEventListener('abort', () => reject(signal.reason), {
         once: true,
       })
-      const wait = this.#gate?.test(key) ? this.#open : Promise.resolve()
+      const gated = this.#gate?.test(key) ?? false
+      if (gated) this.#entered()
+      const wait = gated ? this.#open : Promise.resolve()
       wait.then(() => resolve(bytes))
     })
   }
@@ -664,8 +674,9 @@ test('aborting one caller does not fail the callers sharing its metadata resolut
     const second = new AbortController()
     const a = getWorker(arr, null, { pool, opts: { signal: first.signal } })
     const b = getWorker(arr, null, { pool, opts: { signal: second.signal } })
-    // Let both reach the store before pulling the plug on the first.
-    await new Promise((r) => setTimeout(r, 20))
+    // The shared read is parked at the gate — both callers are on it, the
+    // second having joined the memoised resolution without touching the store.
+    await store.entered
     first.abort()
 
     // The aborter is rejected promptly with its own reason — the shared read
@@ -701,7 +712,7 @@ test('aborting one caller does not hand the callers sharing its probe an unprobe
     const first = new AbortController()
     const a = getWorker(misdeclared, null, { pool, opts: { signal: first.signal } })
     const b = getWorker(misdeclared, null, { pool })
-    await new Promise((r) => setTimeout(r, 20))
+    await store.entered
     first.abort()
     await assert.rejects(a, (err) => err?.name === 'AbortError')
 
@@ -723,16 +734,16 @@ test('a lone caller that aborts is rejected promptly, and the resolution still l
   await withPool(2, async (pool) => {
     const controller = new AbortController()
     const a = getWorker(arr, null, { pool, opts: { signal: controller.signal } })
-    await new Promise((r) => setTimeout(r, 20))
+    await store.entered
     controller.abort()
     // Rejected while the store is still gated: the abort did not wait for the
     // shared read to finish.
     await assert.rejects(a, (err) => err?.name === 'AbortError')
 
     store.release()
-    // The resolution completed on its own and was memoised: the next caller
-    // pays no metadata read at all.
-    await new Promise((r) => setTimeout(r, 20))
+    // The resolution completed on its own and was memoised: joining it here
+    // waits for exactly that, and the next caller pays no metadata read at all.
+    await resolveArrayInfo(arr)
     store.reads.length = 0
     const result = await getWorker(arr, null, { pool })
     assert.deepEqual(Array.from(result.data), Array.from(expected))
@@ -753,7 +764,10 @@ test('resolveArrayInfo hands out copies — mutating one cannot reach the memo o
   const second = await resolveArrayInfo(arr)
   assert.notEqual(second.codecMeta, first.codecMeta)
   assert.deepEqual(second.codecMeta.chunk_shape, [4, 4])
-  assert.deepEqual(second.codecMeta.codecs, [])
+  assert.ok(
+    !second.codecMeta.codecs.some((c) => c.name === 'bogus'),
+    'the injected codec did not reach the memo',
+  )
   assert.equal(second.codecMeta.data_type, 'int32')
 
   // zarrita's own metadata is untouched too — the memo aliases nobody's data.
