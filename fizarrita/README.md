@@ -113,16 +113,28 @@ filters and compressors under zarrita's `numcodecs.` codec names, and
 `fixedscaleoffset` as `scale_offset` + `cast_value`. Numeric data types only
 (`float16` where the runtime has `Float16Array`).
 
-**Sharded arrays** (`sharding_indexed`) read like any other: the shard index
-is range-fetched once per shard and remembered for the store's lifetime, each
-inner chunk is one range request, and workers decode inner chunks with the
-inner codecs. `arr.chunks` is the inner chunk shape, so selections, the
-chunk cache and `useSharedArrayBuffer` all work per inner chunk. As with
-zarrita, the store needs `getRange` (`FetchStore` and `FileSystemStore`
-have it; `zarr.open` refuses a sharded array on a store without), and
-`setWorker` rejects sharded arrays with an `UnsupportedError`, as `zarr.set`
-does. Wrapping the store in `zarr.withRangeCoalescing` batches the inner
-chunk requests of one shard into fewer HTTP round-trips.
+**Sharded arrays** (`sharding_indexed`) read and write like any other.
+`arr.chunks` is the inner chunk shape, so selections, the chunk cache and
+`useSharedArrayBuffer` all work per inner chunk, and workers decode and
+encode inner chunks with the inner codecs.
+
+- *Reads:* the shard index is range-fetched once per shard and remembered
+  for the store's lifetime, and each inner chunk is one range request.
+  Wrapping the store in `zarr.withRangeCoalescing` batches the inner chunk
+  requests of one shard into fewer HTTP round-trips. As with zarrita, the
+  store needs `getRange` (`FetchStore` and `FileSystemStore` have it;
+  `zarr.open` refuses a sharded array on a store without).
+- *Writes* — which zarrita's own `set` refuses: a shard is rewritten as a
+  whole. Inner chunks the write covers are encoded on workers, in parallel;
+  the rest are copied from the shard as stored (which is read only when some
+  of it is kept); the index is rebuilt (`bytes` and `crc32c` index codecs);
+  and the shard is written by the last of its tasks to finish. Every inner
+  chunk the write touches is written, even one that is all fill value. Two
+  concurrent writes to the same shard race, the last one winning — as two
+  concurrent partial writes to one chunk do. A write drops fizarrita's
+  remembered index for the shard; zarrita's own `Array` remembers indexes
+  too and is not told, so read with `zarr.get` through a freshly opened
+  array after writing with `setWorker`.
 
 Stores wrapped with zarrita's store extensions (`zarr.withByteCaching`,
 `zarr.withRangeCoalescing`, `zarr.withConsolidatedMetadata`, or your own

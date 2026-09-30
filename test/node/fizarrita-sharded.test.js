@@ -463,18 +463,281 @@ test('a shard shape the inner chunks do not divide is invalid metadata', async (
 // Writes
 // ---------------------------------------------------------------------------
 
-test('setWorker refuses a sharded array, as zarr.set does', async () => {
-  const store = new RangeStore()
-  const { arr } = await buildSharded(store, GEOMETRY)
-  const before = store.get('/data/c/0/0').slice()
+const ALL_SHARDS = ['0,0', '0,1', '1,0', '1,1']
 
-  await assert.rejects(zarr.set(arr, null, 1), (error) =>
-    zarr.isZarritaError(error, 'UnsupportedError'),
-  )
+/** Open the array afresh: zarrita's own `Array` remembers shard indexes. */
+const reopen = (store) => zarr.open(zarr.root(store).resolve('/data'), { kind: 'array' })
+
+/** Parse a shard's index (at the end, with crc32c) into `(offset, length)` pairs. */
+function parseIndex(shard, count) {
+  const raw = shard.subarray(shard.length - (16 * count + 4), shard.length - 4)
+  const crc = new DataView(shard.buffer, shard.byteOffset + shard.length - 4).getUint32(0, true)
+  assert.equal(crc, crc32c(raw), 'index checksum')
+  return new BigUint64Array(raw.slice().buffer)
+}
+
+/** The bytes of inner chunk `flat` in `shard`, or undefined when absent. */
+function innerBytes(shard, count, flat) {
+  const index = parseIndex(shard, count)
+  const [offset, length] = [index[flat * 2], index[flat * 2 + 1]]
+  if (offset === MISSING) return undefined
+  return shard.subarray(Number(offset), Number(offset + length))
+}
+
+/** `expected` with `patch` (C order, `patchShape`) written at rows/cols from `at`. */
+function withPatch(expected, shape, at, patchShape, patch) {
+  const out = expected.slice()
+  for (let r = 0; r < patchShape[0]; r++) {
+    for (let c = 0; c < patchShape[1]; c++) {
+      out[(at[0] + r) * shape[1] + at[1] + c] = patch[r * patchShape[1] + c]
+    }
+  }
+  return out
+}
+
+test('setWorker writes a whole sharded array that zarr.get reads back', async () => {
+  const store = new RangeStore()
+  const { arr } = await buildSharded(store, {
+    ...GEOMETRY,
+    innerCodecs: ZSTD,
+    missingShards: ALL_SHARDS,
+  })
+  const data = { data: GEOMETRY.values, shape: [10, 12], stride: [12, 1] }
+
+  await withPool(3, async (pool) => {
+    await setWorker(arr, null, data, { pool })
+
+    const fresh = await reopen(store)
+    assert.deepEqual(Array.from((await zarr.get(fresh)).data), Array.from(GEOMETRY.values))
+    const viaWorker = await getWorker(arr, null, { pool })
+    assert.deepEqual(Array.from(viaWorker.data), Array.from(GEOMETRY.values))
+  })
+
+  // Four shards, each indexed for 2x2 inner chunks; inner chunks beyond the
+  // array's edge are absent, not written as fill.
+  const present = (key) =>
+    [0, 1, 2, 3].map((flat) => innerBytes(store.get(key), 4, flat) !== undefined)
+  assert.deepEqual(present('/data/c/0/0'), [true, true, true, true])
+  assert.deepEqual(present('/data/c/0/1'), [true, false, true, false])
+  assert.deepEqual(present('/data/c/1/0'), [true, true, false, false])
+  assert.deepEqual(present('/data/c/1/1'), [true, false, false, false])
+})
+
+for (const useSharedArrayBuffer of [false, true]) {
+  test(`a partial write rewrites only the touched inner chunks (useSharedArrayBuffer: ${useSharedArrayBuffer})`, async () => {
+    const store = new RangeStore()
+    const { arr, expected } = await buildSharded(store, {
+      ...GEOMETRY,
+      innerCodecs: ZSTD,
+      // Inner chunk (0, 1) — rows 0-3, cols 4-7 — is absent from its shard.
+      missing: ['0,1'],
+    })
+    const before = new Map([...store].filter(([k]) => k.includes('/c/')).map(([k, v]) => [k, v.slice()]))
+
+    // Rows 2-5, cols 5-8: shards (0,0) and (0,1); inner column 0 untouched.
+    const patchShape = [4, 4]
+    const patch = Int32Array.from({ length: 16 }, (_, i) => -(i + 100))
+    const selection = [zarr.slice(2, 6), zarr.slice(5, 9)]
+    const after = withPatch(expected, [10, 12], [2, 5], patchShape, patch)
+
+    await withPool(2, async (pool) => {
+      // A read first, so the shard indexes are remembered — and must be
+      // forgotten by the write.
+      assert.deepEqual(Array.from((await getWorker(arr, null, { pool })).data), Array.from(expected))
+
+      await setWorker(arr, selection, { data: patch, shape: patchShape, stride: [4, 1] }, { pool, useSharedArrayBuffer })
+
+      assert.deepEqual(Array.from((await getWorker(arr, null, { pool })).data), Array.from(after))
+      assert.deepEqual(Array.from((await zarr.get(await reopen(store))).data), Array.from(after))
+    })
+
+    // Untouched shards are untouched.
+    assert.deepEqual(store.get('/data/c/1/0'), before.get('/data/c/1/0'))
+    assert.deepEqual(store.get('/data/c/1/1'), before.get('/data/c/1/1'))
+    // In shard (0,0), inner column 0 — flat positions 0 and 2 — kept its bytes;
+    // the absent inner chunk (0,1) — flat 1 — is now present.
+    const shard = store.get('/data/c/0/0')
+    const was = before.get('/data/c/0/0')
+    assert.deepEqual(innerBytes(shard, 4, 0), innerBytes(was, 4, 0))
+    assert.deepEqual(innerBytes(shard, 4, 2), innerBytes(was, 4, 2))
+    assert.equal(innerBytes(was, 4, 1), undefined)
+    assert.notEqual(innerBytes(shard, 4, 1), undefined)
+  })
+}
+
+test('a scalar write to a sharded array with its index at the start', async () => {
+  const store = new RangeStore()
+  const { arr, expected } = await buildSharded(store, {
+    ...GEOMETRY,
+    indexCodecs: [{ name: 'bytes', configuration: { endian: 'little' } }],
+    indexLocation: 'start',
+  })
+  const after = expected.slice()
+  for (let r = 1; r < 9; r++) after[r * 12 + 4] = 99
+
+  await withPool(2, async (pool) => {
+    await setWorker(arr, [zarr.slice(1, 9), 4], 99, { pool })
+    assert.deepEqual(Array.from((await getWorker(arr, null, { pool })).data), Array.from(after))
+  })
+  // The index leads, and offsets are from the shard's start, past the index.
+  const shard = store.get('/data/c/0/0')
+  const index = new BigUint64Array(shard.slice(0, 64).buffer)
+  assert.ok(index[0] >= 64n)
+})
+
+/** A 2-D chunk's values in row-major order, whatever its strides. */
+function logical(chunk) {
+  const out = []
+  const [rows, cols] = chunk.shape
+  const [rs, cs] = chunk.stride
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) out.push(chunk.data[r * rs + c * cs])
+  return out
+}
+
+test('a partial write through transposed inner codecs', async () => {
+  const store = new RangeStore()
+  const { arr, expected } = await buildSharded(store, {
+    ...GEOMETRY,
+    innerCodecs: [
+      { name: 'transpose', configuration: { order: [1, 0] } },
+      { name: 'bytes', configuration: { endian: 'little' } },
+    ],
+  })
+  const patch = Int32Array.from({ length: 6 }, (_, i) => 1000 + i)
+  const after = withPatch(expected, [10, 12], [3, 6], [2, 3], patch)
+
+  await withPool(2, async (pool) => {
+    // The shards as built read back first, both ways. zarr.get keeps the
+    // array's transposed layout; getWorker returns C order.
+    assert.deepEqual(logical(await zarr.get(arr)), Array.from(expected), 'zarr.get before')
+    assert.deepEqual(Array.from((await getWorker(arr, null, { pool })).data), Array.from(expected), 'getWorker before')
+    await setWorker(arr, [zarr.slice(3, 5), zarr.slice(6, 9)], { data: patch, shape: [2, 3], stride: [3, 1] }, { pool })
+    assert.deepEqual(Array.from((await getWorker(arr, null, { pool })).data), Array.from(after))
+  })
+  assert.deepEqual(logical(await zarr.get(await reopen(store))), Array.from(after))
+})
+
+test('aborting a sharded write leaves the shards still queued untouched', async () => {
+  const controller = new AbortController()
+  const reason = new Error('stop writing')
+  let shardWrites = 0
+  let armed = false
+  class AbortAfterFirstShard extends RangeStore {
+    set(key, value) {
+      super.set(key, value)
+      if (armed && key.includes('/c/')) {
+        shardWrites++
+        controller.abort(reason)
+      }
+      return this
+    }
+  }
+  const store = new AbortAfterFirstShard()
+  const { arr } = await buildSharded(store, GEOMETRY)
+  const before = new Map([...store].filter(([k]) => k.includes('/c/')).map(([k, v]) => [k, v.slice()]))
+  armed = true
+
   await withPool(1, async (pool) => {
-    await assert.rejects(setWorker(arr, null, 1, { pool }), (error) =>
-      zarr.isZarritaError(error, 'UnsupportedError'),
+    await assert.rejects(
+      setWorker(arr, null, 5, { pool, signal: controller.signal }),
+      (error) => error === reason,
     )
   })
-  assert.deepEqual(store.get('/data/c/0/0'), before, 'nothing was written')
+  assert.equal(shardWrites, 1, 'only the shard written before the abort')
+  const changed = [...before].filter(([k, v]) => !store.get(k).every((b, i) => b === v[i]))
+  assert.equal(changed.length, 1)
+})
+
+test('a shard replaced outright is written without being read', async () => {
+  const store = new RangeStore()
+  const { arr, expected } = await buildSharded(store, { ...GEOMETRY, innerCodecs: ZSTD })
+  // Shard (0,0) is rows 0-7, cols 0-7: four inner chunks, all covered.
+  const patch = Int32Array.from({ length: 64 }, (_, i) => -i)
+  const after = withPatch(expected, [10, 12], [0, 0], [8, 8], patch)
+
+  await withPool(2, async (pool) => {
+    store.gets.length = 0
+    await setWorker(arr, [zarr.slice(0, 8), zarr.slice(0, 8)], { data: patch, shape: [8, 8], stride: [8, 1] }, { pool })
+    assert.equal(store.gets.filter((k) => k.includes('/c/')).length, 0, 'the stored shard was not fetched')
+    assert.deepEqual(Array.from((await getWorker(arr, null, { pool })).data), Array.from(after))
+  })
+  assert.deepEqual(Array.from((await zarr.get(await reopen(store))).data), Array.from(after))
+})
+
+test('a big-endian index codec is honoured on write and read', async () => {
+  const store = new RangeStore()
+  const { arr } = await buildSharded(store, {
+    ...GEOMETRY,
+    indexCodecs: [
+      { name: 'bytes', configuration: { endian: 'big' } },
+      { name: 'crc32c', configuration: {} },
+    ],
+    missingShards: ALL_SHARDS,
+  })
+  const data = { data: GEOMETRY.values, shape: [10, 12], stride: [12, 1] }
+
+  await withPool(2, async (pool) => {
+    await setWorker(arr, null, data, { pool })
+    assert.deepEqual(Array.from((await getWorker(arr, null, { pool })).data), Array.from(GEOMETRY.values))
+  })
+  assert.deepEqual(Array.from((await zarr.get(await reopen(store))).data), Array.from(GEOMETRY.values))
+  // The first entry of shard (0,0) is offset 0, length > 0 — big-endian, so
+  // its length's low byte is the last of the second uint64.
+  const shard = store.get('/data/c/0/0')
+  const index = shard.subarray(shard.length - 68, shard.length - 4)
+  assert.deepEqual(Array.from(index.subarray(0, 8)), [0, 0, 0, 0, 0, 0, 0, 0])
+  assert.notEqual(index[15], 0)
+  assert.equal(index[8], 0)
+})
+
+test('a stored shard whose index points past its end is invalid metadata', async () => {
+  const store = new RangeStore()
+  const { arr } = await buildSharded(store, GEOMETRY)
+  // Inner chunk (0,0)'s length, in the index at the shard's end: one byte
+  // more than the shard holds.
+  const shard = store.get('/data/c/0/0')
+  new DataView(shard.buffer, shard.byteOffset).setBigUint64(shard.length - 68 + 8, BigInt(shard.length + 1), true)
+
+  await withPool(1, async (pool) => {
+    // A partial write reads the shard to keep the rest of it.
+    await assert.rejects(setWorker(arr, [0, 0], 1, { pool }), (error) => {
+      assert.ok(zarr.isZarritaError(error, 'InvalidMetadataError'), String(error))
+      assert.match(error.message, /past the shard's end/)
+      return true
+    })
+  })
+})
+
+test('a stored shard shorter than its index is invalid metadata', async () => {
+  const store = new RangeStore()
+  const { arr } = await buildSharded(store, GEOMETRY)
+  store.set('/data/c/0/0', store.get('/data/c/0/0').subarray(0, 3))
+
+  await withPool(1, async (pool) => {
+    await assert.rejects(setWorker(arr, [0, 0], 1, { pool }), (error) =>
+      zarr.isZarritaError(error, 'InvalidMetadataError') && /shorter than/.test(error.message),
+    )
+  })
+})
+
+test('an index codec that cannot be encoded is refused', async () => {
+  const store = new RangeStore()
+  const { arr } = await buildSharded(store, {
+    ...GEOMETRY,
+    indexCodecs: [
+      { name: 'bytes', configuration: { endian: 'little' } },
+      { name: 'gzip', configuration: { level: 1 } },
+    ],
+    missingShards: ALL_SHARDS,
+  })
+
+  await withPool(1, async (pool) => {
+    // Shard (0,0) replaced outright, so nothing is read: the refusal is the
+    // index encoder's.
+    await assert.rejects(
+      setWorker(arr, [zarr.slice(0, 8), zarr.slice(0, 8)], 1, { pool }),
+      (error) =>
+        zarr.isZarritaError(error, 'UnsupportedError') && /gzip/.test(error.message),
+    )
+  })
 })
