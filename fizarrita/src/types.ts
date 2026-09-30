@@ -6,7 +6,7 @@
  */
 
 import type { WorkerPool } from '@fideus-labs/worker-pool'
-import type { Chunk, CodecMetadata, DataType, Readable } from 'zarrita'
+import type { Chunk, CodecMetadata, DataType, Readable, Scalar } from 'zarrita'
 
 // ---------------------------------------------------------------------------
 // Codec chunk metadata — sent to the worker to reconstruct the codec pipeline
@@ -20,6 +20,13 @@ export interface CodecChunkMeta {
   data_type: DataType
   chunk_shape: number[]
   codecs: CodecMetadata[]
+  /**
+   * The array's fill value, as zarrita types it (bigint for int64/uint64,
+   * `NaN`/`Infinity` as numbers). Part of the metadata zarrita configures
+   * codecs with, so a codec in the worker sees what it would under
+   * `zarr.get`; `cast_value` forwards a converted one to the codecs after it.
+   */
+  fill_value?: Scalar<DataType> | null
 }
 
 // ---------------------------------------------------------------------------
@@ -63,6 +70,8 @@ export interface EncodeRequest {
   id: number
   data: ArrayBuffer
   metaId: number
+  /** Strides of `data`; C order when omitted. */
+  stride?: number[]
 }
 
 export interface EncodeResponse {
@@ -115,6 +124,31 @@ export interface DecodeIntoRequest {
 export interface DecodeIntoResponse {
   type: 'decode_into_ok'
   id: number
+}
+
+// ---------------------------------------------------------------------------
+// Errors — a zarrita structured error, flattened for postMessage
+// ---------------------------------------------------------------------------
+
+/**
+ * What a worker reports about a failure that was one of zarrita's structured
+ * errors, alongside the plain `error` message. The main thread rebuilds the
+ * error from it, so a failed decode rejects `getWorker` with the same
+ * `CodecPipelineError` / `UnknownCodecError` that `zarr.get` would, and
+ * `zarr.isZarritaError` recognises it.
+ */
+export interface WorkerErrorInfo {
+  /** The error's `_tag`, e.g. `'CodecPipelineError'`. */
+  tag: string
+  message: string
+  /** `CodecPipelineError`: which way the pipeline was running. */
+  direction?: 'encode' | 'decode'
+  /** `CodecPipelineError` / `UnknownCodecError`: the codec involved. */
+  codec?: string
+  /** `CodecPipelineError`: the message of the codec's own error. */
+  cause?: string
+  /** `UnsupportedError`: the missing capability. */
+  feature?: string
 }
 
 export type WorkerRequest = InitRequest | DecodeRequest | EncodeRequest | DecodeIntoRequest
@@ -205,6 +239,16 @@ export interface GetWorkerOptions<StoreOpts = unknown> {
 export interface SetWorkerOptions {
   /** The WorkerPool to use for codec encode/decode operations. */
   pool: WorkerPool
+  /**
+   * Aborts the write, as `signal` does for zarrita's own `set`. Chunk tasks
+   * still queued on the pool when the signal fires are dropped rather than
+   * started, reads of existing chunks for partial updates are given the
+   * signal, and the returned promise rejects with the signal's reason.
+   *
+   * Chunks already written stay written: like `zarr.set`, a write is not
+   * transactional, and aborting part-way leaves some chunks updated.
+   */
+  signal?: AbortSignal
   /**
    * URL of the codec worker script. If not provided, uses the default
    * codec-worker bundled with this package.

@@ -12,9 +12,15 @@ import type {
   WorkerLike,
   WorkerMessageEventLike,
 } from '@fideus-labs/worker-pool'
+import {
+  CodecPipelineError,
+  InvalidMetadataError,
+  UnknownCodecError,
+  UnsupportedError,
+} from 'zarrita'
 import type { Chunk, DataType, TypedArray } from 'zarrita'
 import { get_ctr } from './internals/util.js'
-import type { CodecChunkMeta, Projection } from './types.js'
+import type { CodecChunkMeta, Projection, WorkerErrorInfo } from './types.js'
 
 // ---------------------------------------------------------------------------
 // Persistent message dispatcher
@@ -24,6 +30,34 @@ interface PendingRequest {
   resolve: (data: unknown) => void
   reject: (err: Error) => void
 }
+
+/**
+ * Rebuild a worker's failure as the error it was: one of zarrita's structured
+ * errors when the worker described one (see {@link WorkerErrorInfo}), so
+ * callers can branch on `zarr.isZarritaError(e, 'CodecPipelineError')` exactly
+ * as they would for `zarr.get`; a plain `Error` otherwise.
+ */
+function reviveError(message: string, info?: WorkerErrorInfo): Error {
+  switch (info?.tag) {
+    case 'CodecPipelineError':
+      return new CodecPipelineError({
+        direction: info.direction ?? 'decode',
+        codec: info.codec,
+        cause: new Error(info.cause),
+      })
+    case 'UnknownCodecError':
+      if (info.codec !== undefined) return new UnknownCodecError(info.codec)
+      break
+    case 'InvalidMetadataError':
+      return new InvalidMetadataError(info.message)
+    case 'UnsupportedError':
+      if (info.feature !== undefined) return new UnsupportedError(info.feature)
+      break
+  }
+  return new Error(message)
+}
+
+export { atChunk } from './internals/errors.js'
 
 /**
  * Per-worker dispatcher. Installs a single persistent `message` and `error`
@@ -46,7 +80,7 @@ class WorkerDispatcher {
     this.pending.delete(id)
 
     if (event.data.error) {
-      req.reject(new Error(event.data.error))
+      req.reject(reviveError(event.data.error, event.data.errorInfo))
     } else {
       req.resolve(event.data)
     }
@@ -105,11 +139,26 @@ const metaKeyToId = new Map<string, number>()
 const metaIdToMeta = new Map<number, CodecChunkMeta>()
 
 /**
+ * The dedup key of a codec metadata object. `JSON.stringify` alone would
+ * throw on a bigint fill value and write `NaN` and `null` the same, so those
+ * are spelled out; the key is never parsed back.
+ */
+function metaKey(meta: CodecChunkMeta): string {
+  return JSON.stringify(meta, (_, value) =>
+    typeof value === 'bigint'
+      ? `${value}n`
+      : typeof value === 'number' && !Number.isFinite(value)
+        ? String(value)
+        : value,
+  )
+}
+
+/**
  * Get or create a stable metaId for the given codec metadata.
- * Uses JSON.stringify as the dedup key — called once per unique array config.
+ * Keyed by its serialisation — called once per unique array config.
  */
 export function getMetaId(meta: CodecChunkMeta): number {
-  const key = JSON.stringify(meta)
+  const key = metaKey(meta)
   let id = metaKeyToId.get(key)
   if (id === undefined) {
     id = nextMetaId++
@@ -223,12 +272,16 @@ export async function workerDecode<D extends DataType>(
 
 /**
  * Send chunk data to a codec worker for encoding and return the encoded bytes.
+ *
+ * @param stride - Strides of `data`, when it is not laid out in C order (a
+ *   chunk decoded through a transpose codec and modified in place).
  */
 export async function workerEncode<D extends DataType>(
   worker: WorkerLike,
   data: TypedArray<D>,
   metaId: number,
   meta: CodecChunkMeta,
+  stride?: number[],
 ): Promise<Uint8Array> {
   const dispatcher = getDispatcher(worker)
   await ensureMeta(dispatcher, metaId)
@@ -249,7 +302,7 @@ export async function workerEncode<D extends DataType>(
 
   const response = await dispatcher.send(
     id,
-    { type: 'encode', id, data: transferBuffer, metaId },
+    { type: 'encode', id, data: transferBuffer, metaId, stride },
     [transferBuffer],
   ) as { bytes: ArrayBuffer }
 
@@ -272,6 +325,7 @@ export async function workerEncodeShared<D extends DataType>(
   data: TypedArray<D>,
   metaId: number,
   meta: CodecChunkMeta,
+  stride?: number[],
 ): Promise<Uint8Array> {
   const dispatcher = getDispatcher(worker)
   await ensureMeta(dispatcher, metaId)
@@ -291,7 +345,7 @@ export async function workerEncodeShared<D extends DataType>(
 
   const response = await dispatcher.send(
     id,
-    { type: 'encode', id, data: copy, metaId },
+    { type: 'encode', id, data: copy, metaId, stride },
     [copy],
   ) as { bytes: ArrayBuffer }
 

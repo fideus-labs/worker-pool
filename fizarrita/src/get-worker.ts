@@ -35,8 +35,26 @@ import {
   get_ctr,
   get_strides,
 } from "./internals/util.js"
+import {
+  combineAbortSignals,
+  separateSignal,
+  untilAborted,
+} from "./internals/abort.js"
+import {
+  createChunkSource,
+  createShardedChunkSource,
+  resolve_sharding,
+  SHARDING_CODEC,
+  type ShardingInfo,
+} from "./internals/sharding.js"
+import { v2_codecs } from "./internals/v2.js"
 import type { ChunkCache, CodecChunkMeta, GetWorkerOptions } from "./types.js"
-import { getMetaId, workerDecode, workerDecodeInto } from "./worker-rpc.js"
+import {
+  atChunk,
+  getMetaId,
+  workerDecode,
+  workerDecodeInto,
+} from "./worker-rpc.js"
 
 /** Shared TextDecoder instance. */
 const decoder = new TextDecoder()
@@ -146,9 +164,20 @@ function shareInFlightChunk<D extends DataType>(
 // ---------------------------------------------------------------------------
 
 export interface ArrayMetadata {
+  /**
+   * What the codec worker decodes a chunk with. For a sharded array this is
+   * the *inner* chunk shape and codecs — the shards themselves are never
+   * decoded as a unit.
+   */
   codecMeta: CodecChunkMeta
+  /**
+   * Chunk coordinates to store key. For a sharded array it encodes *shard*
+   * coordinates; an inner chunk has no key of its own.
+   */
   encodeChunkKey: (chunk_coords: number[]) => string
   fillValue: Scalar<DataType> | null
+  /** Present for a sharded array: how to find inner chunks in their shards. */
+  sharding?: ShardingInfo
 }
 
 /**
@@ -176,14 +205,42 @@ export async function readArrayMetadata<
   const v3Bytes = await store.get(v3Path, storeOpts)
   if (v3Bytes) {
     const metadata = JSON.parse(decoder.decode(v3Bytes))
+    const encodeChunkKey = create_chunk_key_encoder(metadata.chunk_key_encoding)
+    // zarrita's reading of `fill_value`: "NaN"/"Infinity" as numbers, and
+    // int64/uint64 as bigint, ready to fill a typed array with.
+    const fillValue = arr.fillValue
+    const grid_chunk_shape: number[] =
+      metadata.chunk_grid.configuration.chunk_shape
+    const shardingCodec = (metadata.codecs as CodecMetadata[]).find(
+      (codec) => codec.name === SHARDING_CODEC,
+    )
+    if (shardingCodec) {
+      // The outer grid's chunks are shards; the worker decodes inner chunks.
+      const { chunk_shape, codecs, sharding } = resolve_sharding(
+        grid_chunk_shape,
+        shardingCodec.configuration,
+      )
+      return {
+        codecMeta: {
+          data_type: metadata.data_type,
+          chunk_shape,
+          codecs,
+          fill_value: fillValue,
+        },
+        encodeChunkKey,
+        fillValue,
+        sharding,
+      }
+    }
     return {
       codecMeta: {
         data_type: metadata.data_type,
-        chunk_shape: metadata.chunk_grid.configuration.chunk_shape,
+        chunk_shape: grid_chunk_shape,
         codecs: metadata.codecs,
+        fill_value: fillValue,
       },
-      encodeChunkKey: create_chunk_key_encoder(metadata.chunk_key_encoding),
-      fillValue: metadata.fill_value ?? null,
+      encodeChunkKey,
+      fillValue,
     }
   }
 
@@ -194,20 +251,7 @@ export async function readArrayMetadata<
   const v2Bytes = await store.get(v2Path, storeOpts)
   if (v2Bytes) {
     const metadata = JSON.parse(decoder.decode(v2Bytes))
-    const codecs: Array<{
-      name: string
-      configuration: Record<string, unknown>
-    }> = []
-    if (metadata.order === "F") {
-      codecs.push({ name: "transpose", configuration: { order: "F" } })
-    }
-    if (metadata.compressor) {
-      const { id, ...configuration } = metadata.compressor
-      codecs.push({ name: id, configuration })
-    }
-    for (const { id, ...configuration } of metadata.filters ?? []) {
-      codecs.push({ name: id, configuration })
-    }
+    const codecs = v2_codecs(metadata)
     return {
       codecMeta: {
         data_type: arr.dtype,
@@ -216,12 +260,13 @@ export async function readArrayMetadata<
           codecs.length > 0
             ? codecs
             : [{ name: "bytes", configuration: { endian: "little" } }],
+        fill_value: arr.fillValue,
       },
       encodeChunkKey: create_chunk_key_encoder({
         name: "v2",
         configuration: { separator: metadata.dimension_separator ?? "." },
       }),
-      fillValue: metadata.fill_value ?? null,
+      fillValue: arr.fillValue,
     }
   }
 
@@ -231,9 +276,10 @@ export async function readArrayMetadata<
       data_type: arr.dtype,
       chunk_shape: arr.chunks,
       codecs: [{ name: "bytes", configuration: { endian: "little" } }],
+      fill_value: arr.fillValue,
     },
     encodeChunkKey: create_chunk_key_encoder({ name: "default" }),
-    fillValue: null,
+    fillValue: arr.fillValue,
   }
 }
 
@@ -386,6 +432,15 @@ export function hasSizeChangingCodec(
   })
 }
 
+/** Codecs whose stored element type can differ from the array's data type. */
+const TYPE_CHANGING_CODECS = new Set(["cast_value"])
+
+function hasTypeChangingCodec(
+  codecs: readonly Pick<CodecMetadata, "name">[],
+): boolean {
+  return codecs.some((codec) => TYPE_CHANGING_CODECS.has(codec.name))
+}
+
 /**
  * Try to determine the decompressed byte size of a raw chunk without full decoding.
  *
@@ -403,13 +458,20 @@ async function probeDecompressedSize<D extends DataType>(
   codecMeta: CodecChunkMeta,
   bytesPerElement: number,
 ): Promise<number | null> {
-  // 1. Try zstd header (cheapest — just reads a few bytes)
-  const zstdSize = readZstdFrameContentSize(rawBytes)
-  if (zstdSize != null) return zstdSize
+  // The frame headers give the byte length of the *stored* values. That is
+  // the array's byte length only when the stored element type is the array's
+  // own: a `cast_value` (e.g. a v2 `fixedscaleoffset` quantizing float32 to
+  // uint8) stores narrower elements, and dividing the stored length by the
+  // array's element size would under-count the chunk.
+  if (!hasTypeChangingCodec(codecMeta.codecs)) {
+    // 1. Try zstd header (cheapest — just reads a few bytes)
+    const zstdSize = readZstdFrameContentSize(rawBytes)
+    if (zstdSize != null) return zstdSize
 
-  // 2. Try blosc header
-  const bloscSize = readBloscFrameContentSize(rawBytes)
-  if (bloscSize != null) return bloscSize
+    // 2. Try blosc header
+    const bloscSize = readBloscFrameContentSize(rawBytes)
+    if (bloscSize != null) return bloscSize
+  }
 
   // 3. Check whether the codec chain preserves byte count end to end — a
   //    transpose + bytes chain does, not just a bare bytes one. When it does,
@@ -425,6 +487,7 @@ async function probeDecompressedSize<D extends DataType>(
       data_type: codecMeta.data_type,
       shape: codecMeta.chunk_shape,
       codecs: codecMeta.codecs,
+      fill_value: codecMeta.fill_value,
     })
     const chunk = await pipeline.decode(rawBytes)
     const data = chunk.data as unknown as ArrayLike<unknown>
@@ -831,82 +894,6 @@ const resolvedArrayInfo = new WeakMap<
   Map<string, Promise<{ info: ArrayMetadata; conclusive: boolean }>>
 >()
 
-function isAbortSignal(value: unknown): value is AbortSignal {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    typeof (value as AbortSignal).aborted === "boolean" &&
-    typeof (value as AbortSignal).addEventListener === "function"
-  )
-}
-
-/**
- * Split a caller's store options into what a *shared* store request may carry
- * and the caller's own `AbortSignal`, if the options hold one.
- *
- * Everything else — headers, credentials, cache mode — describes how to talk
- * to the store and is the same for every caller of the same store, so it can
- * safely govern a request made on behalf of all of them. A signal is the one
- * option that belongs to a single caller: it says "I no longer want this",
- * which is not a statement the others have made.
- *
- * Only a real signal is separated. Options with no `signal`, or one that is
- * not an `AbortSignal`, are passed through untouched — same object, no copy.
- */
-function separateSignal<Opts>(storeOpts: Opts): {
-  shared: Opts
-  signal: AbortSignal | undefined
-} {
-  if (storeOpts && typeof storeOpts === "object" && "signal" in storeOpts) {
-    const { signal, ...shared } = storeOpts as Opts & { signal?: unknown }
-    if (isAbortSignal(signal)) {
-      return { shared: shared as Opts, signal }
-    }
-  }
-  return { shared: storeOpts, signal: undefined }
-}
-
-/**
- * Settle as `promise` does, unless `signal` aborts first — then reject with
- * the abort reason, exactly as a fetch given that signal would. `promise`
- * itself is untouched and keeps running for whoever else awaits it.
- *
- * Whatever the outcome, `promise` is observed here: once the caller has been
- * rejected on the signal's account, this is the only place still watching
- * the promise it was handed, and a promise that later rejects with nobody
- * watching is an unhandled rejection — fatal under Node's default.
- */
-function untilAborted<T>(
-  promise: Promise<T>,
-  signal: AbortSignal | undefined,
-): Promise<T> {
-  if (!signal) return promise
-  const reason = () =>
-    signal.reason ?? new DOMException("The operation was aborted.", "AbortError")
-  if (signal.aborted) {
-    // The caller never sees `promise` — a fresh derived promise at both call
-    // sites — so absorb its outcome rather than leave a rejection unhandled.
-    // Other observers of the same chain are unaffected by this.
-    promise.catch(() => {})
-    return Promise.reject(reason())
-  }
-  return new Promise<T>((resolve, reject) => {
-    const onAbort = () => reject(reason())
-    signal.addEventListener("abort", onAbort, { once: true })
-    const settled = () => signal.removeEventListener("abort", onAbort)
-    promise.then(
-      (value) => {
-        settled()
-        resolve(value)
-      },
-      (error) => {
-        settled()
-        reject(error)
-      },
-    )
-  })
-}
-
 /**
  * A private copy of a memoised entry for one caller. `codecMeta` is plain
  * JSON data (that is what {@link getMetaId} relies on), so a structured clone
@@ -922,6 +909,7 @@ function detach(info: ArrayMetadata): ArrayMetadata {
     codecMeta: structuredClone(info.codecMeta),
     encodeChunkKey: info.encodeChunkKey,
     fillValue: structuredClone(info.fillValue),
+    ...(info.sharding && { sharding: structuredClone(info.sharding) }),
   }
 }
 
@@ -978,23 +966,27 @@ export function resolveArrayInfo<D extends DataType, Store extends Readable>(
   }
 
   const promise = (async () => {
-    const { codecMeta, encodeChunkKey, fillValue } = await readArrayMetadata(
-      arr,
-      shared,
-    )
+    const { codecMeta, encodeChunkKey, fillValue, sharding } =
+      await readArrayMetadata(arr, shared)
     const Ctr = get_ctr(arr.dtype)
     const bytesPerElement = (Ctr as unknown as { BYTES_PER_ELEMENT: number })
       .BYTES_PER_ELEMENT
     // No signal for the probe to watch: its fetches run under `shared`, which
     // carries none — the caller's signal governs the caller's wait (below),
     // never the shared resolution.
-    const { shape, conclusive } = await probeChunkShape(
-      arr,
-      encodeChunkKey,
-      codecMeta,
-      bytesPerElement,
-      shared,
-    )
+    //
+    // A sharded array is not probed: the probe corrects a chunk shape the
+    // metadata misdeclares, and a shard's index states each inner chunk's
+    // exact extent — there is nothing to guess, and `c/0/0` is a whole shard.
+    const { shape, conclusive } = sharding
+      ? { shape: codecMeta.chunk_shape, conclusive: true }
+      : await probeChunkShape(
+          arr,
+          encodeChunkKey,
+          codecMeta,
+          bytesPerElement,
+          shared,
+        )
     return {
       // Cloned so the memo owns its data outright — see detach.
       info: detach({
@@ -1004,6 +996,7 @@ export function resolveArrayInfo<D extends DataType, Store extends Readable>(
             : codecMeta,
         encodeChunkKey,
         fillValue,
+        sharding,
       }),
       conclusive,
     }
@@ -1031,31 +1024,6 @@ export function resolveArrayInfo<D extends DataType, Store extends Readable>(
 // ---------------------------------------------------------------------------
 // getWorker
 // ---------------------------------------------------------------------------
-
-/**
- * Combine two abort signals into one that fires when either does.
- *
- * `AbortSignal.any` where available; on runtimes that predate it (Safari
- * before 17.4, Node before 20.3) a controller bridge. The bridge's listeners
- * stay on the parent signals for the parents' lifetime — acceptable for
- * one-shot read signals, which is the only way this module uses them.
- */
-function combineAbortSignals(a: AbortSignal, b: AbortSignal): AbortSignal {
-  if (typeof AbortSignal.any === "function") {
-    return AbortSignal.any([a, b])
-  }
-  if (a.aborted) return a
-  if (b.aborted) return b
-  const controller = new AbortController()
-  const forward = (signal: AbortSignal) => {
-    signal.addEventListener("abort", () => controller.abort(signal.reason), {
-      once: true,
-    })
-  }
-  forward(a)
-  forward(b)
-  return controller.signal
-}
 
 /**
  * Read data from a zarrita Array with codec decoding offloaded to Web Workers.
@@ -1136,10 +1104,8 @@ export async function getWorker<
   // codecMeta.chunk_shape is already the probed (possibly corrected) shape.
   // Given `storeOpts`, so the combined signal governs *this call's wait* on
   // the resolution — the resolution itself is shared and runs signal-free.
-  const { codecMeta, encodeChunkKey, fillValue } = await resolveArrayInfo(
-    arr,
-    storeOpts,
-  )
+  const { codecMeta, encodeChunkKey, fillValue, sharding } =
+    await resolveArrayInfo(arr, storeOpts)
 
   const Ctr = get_ctr(arr.dtype)
   const bytesPerElement = (Ctr as unknown as { BYTES_PER_ELEMENT: number })
@@ -1166,6 +1132,19 @@ export async function getWorker<
     chunk_shape: chunkShape,
   })
 
+  // Where each chunk's bytes come from: its own key, or — for a sharded
+  // array — its slice of a shard, located through the shard's index. The
+  // worker decodes what comes back the same way either way.
+  const sourceFor = sharding
+    ? createShardedChunkSource(
+        arr,
+        encodeChunkKey,
+        chunkShape,
+        sharding,
+        storeOpts,
+      )
+    : createChunkSource(arr, encodeChunkKey, storeOpts)
+
   // Allocate output — backed by SharedArrayBuffer when requested
   const size = indexer.shape.reduce((a: number, b: number) => a * b, 1)
   const buffer = createBuffer(size * bytesPerElement, useShared)
@@ -1177,8 +1156,7 @@ export async function getWorker<
   const tasks: WorkerPoolTask<void>[] = []
 
   for (const { chunk_coords, mapping } of indexer) {
-    const chunkKey = encodeChunkKey(chunk_coords)
-    const chunkPath = arr.resolve(chunkKey).path
+    const { path: chunkPath, fetch: fetchChunk } = sourceFor(chunk_coords)
 
     // Compute edge chunk shape: min(chunk_shape[d], array_shape[d] - coord * chunk_shape[d])
     const edgeChunkShape = chunk_coords.map((coord, dim) =>
@@ -1235,7 +1213,7 @@ export async function getWorker<
       // anyone else, so this path cannot participate in sharing and is left
       // exactly as it was.
       if (useShared && !opts.cache) {
-        const rawBytes = await arr.store.get(chunkPath, storeOpts)
+        const rawBytes = await fetchChunk()
         if (!rawBytes) {
           setter.set_from_chunk(out, buildFillChunk(), mapping)
         } else {
@@ -1254,7 +1232,7 @@ export async function getWorker<
             )
           } catch (error) {
             worker.terminate()
-            throw error
+            throw atChunk(error, chunkPath)
           }
         }
         return { worker, result: undefined as void }
@@ -1275,7 +1253,7 @@ export async function getWorker<
       // duplicate network round-trip and a duplicate decompression of bytes
       // already in flight, so it is not work being given up.
       const produce = async (): Promise<Chunk<D>> => {
-        const rawBytes = await arr.store.get(chunkPath, storeOpts)
+        const rawBytes = await fetchChunk()
         if (!rawBytes) {
           return buildFillChunk()
         }
@@ -1289,7 +1267,7 @@ export async function getWorker<
           )
         } catch (error) {
           worker.terminate()
-          throw error
+          throw atChunk(error, chunkPath)
         }
       }
 

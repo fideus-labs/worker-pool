@@ -41,8 +41,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [4, 4],
-        chunk_shape: [2, 2],
-        data_type: 'int32',
+        chunkShape: [2, 2],
+        dtype: 'int32',
       })
 
       // Write data using zarrita's built-in set
@@ -84,8 +84,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [6],
-        chunk_shape: [3],
-        data_type: 'float32',
+        chunkShape: [3],
+        dtype: 'float32',
       })
 
       // Write using setWorker
@@ -118,8 +118,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [3, 3],
-        chunk_shape: [3, 3],
-        data_type: 'float64',
+        chunkShape: [3, 3],
+        dtype: 'float64',
       })
 
       // Set all elements to 42.0
@@ -147,8 +147,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [10],
-        chunk_shape: [5],
-        data_type: 'int32',
+        chunkShape: [5],
+        dtype: 'int32',
       })
 
       // Write sequential data
@@ -181,8 +181,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [6],
-        chunk_shape: [3],
-        data_type: 'int32',
+        chunkShape: [3],
+        dtype: 'int32',
       })
 
       // Fill with 1s
@@ -214,8 +214,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [8, 8],
-        chunk_shape: [4, 4],
-        data_type: 'float32',
+        chunkShape: [4, 4],
+        dtype: 'float32',
       })
 
       // Write data
@@ -254,8 +254,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [4],
-        chunk_shape: [2],
-        data_type: 'uint8',
+        chunkShape: [2],
+        dtype: 'uint8',
       })
 
       // Write with setWorker
@@ -286,8 +286,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [4],
-        chunk_shape: [2],
-        data_type: 'int32',
+        chunkShape: [2],
+        dtype: 'int32',
       })
 
       await zarr.set(arr, null, {
@@ -326,8 +326,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [3],
-        chunk_shape: [3],
-        data_type: 'float64',
+        chunkShape: [3],
+        dtype: 'float64',
       })
 
       await setWorker(arr, null, {
@@ -355,8 +355,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [4],
-        chunk_shape: [2],
-        data_type: 'uint16',
+        chunkShape: [2],
+        dtype: 'uint16',
       })
 
       await setWorker(arr, null, {
@@ -388,8 +388,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       // 16 chunks to process
       const arr = await zarr.create(store, {
         shape: [16],
-        chunk_shape: [1],
-        data_type: 'int32',
+        chunkShape: [1],
+        dtype: 'int32',
       })
 
       const data = new Int32Array(16)
@@ -419,8 +419,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [4, 4, 4],
-        chunk_shape: [2, 2, 2],
-        data_type: 'float32',
+        chunkShape: [2, 2, 2],
+        dtype: 'float32',
       })
 
       // Fill with sequential values
@@ -462,8 +462,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [5],
-        chunk_shape: [5],
-        data_type: 'int32',
+        chunkShape: [5],
+        dtype: 'int32',
       })
 
       await zarr.set(arr, null, {
@@ -494,9 +494,9 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [6],
-        chunk_shape: [3],
-        data_type: 'int32',
-        fill_value: -1,
+        chunkShape: [3],
+        dtype: 'int32',
+        fillValue: -1,
       })
 
       // Only write to the first chunk
@@ -532,8 +532,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [4],
-        chunk_shape: [4],
-        data_type: 'int32',
+        chunkShape: [4],
+        dtype: 'int32',
         codecs: [
           { name: 'bytes', configuration: { endian: 'little' } },
           { name: 'gzip', configuration: { level: 1 } },
@@ -585,8 +585,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [4, 4],
-        chunk_shape: [2, 2],
-        data_type: 'int32',
+        chunkShape: [2, 2],
+        dtype: 'int32',
       })
 
       // Write data
@@ -618,8 +618,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [4],
-        chunk_shape: [4],
-        data_type: 'int32',
+        chunkShape: [4],
+        dtype: 'int32',
       })
 
       await zarr.set(arr, null, {
@@ -649,8 +649,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [10],
-        chunk_shape: [5],
-        data_type: 'int32',
+        chunkShape: [5],
+        dtype: 'int32',
       })
 
       const data = new Int32Array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9])
@@ -683,9 +683,9 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [6],
-        chunk_shape: [3],
-        data_type: 'int32',
-        fill_value: -1,
+        chunkShape: [3],
+        dtype: 'int32',
+        fillValue: -1,
       })
 
       // Only write to the first chunk
@@ -720,8 +720,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [8, 8],
-        chunk_shape: [4, 4],
-        data_type: 'float32',
+        chunkShape: [4, 4],
+        dtype: 'float32',
       })
 
       const data = new Float32Array(64)
@@ -759,8 +759,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [4, 4, 4],
-        chunk_shape: [2, 2, 2],
-        data_type: 'float32',
+        chunkShape: [2, 2, 2],
+        dtype: 'float32',
       })
 
       // Fill with sequential values
@@ -803,8 +803,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [4],
-        chunk_shape: [4],
-        data_type: 'int32',
+        chunkShape: [4],
+        dtype: 'int32',
         codecs: [
           { name: 'bytes', configuration: { endian: 'little' } },
           { name: 'gzip', configuration: { level: 1 } },
@@ -852,8 +852,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [6],
-        chunk_shape: [3],
-        data_type: 'float32',
+        chunkShape: [3],
+        dtype: 'float32',
       })
 
       // Write using setWorker with SAB
@@ -882,8 +882,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [6],
-        chunk_shape: [3],
-        data_type: 'int32',
+        chunkShape: [3],
+        dtype: 'int32',
       })
 
       // Fill with 1s using regular setWorker
@@ -910,8 +910,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [3, 3],
-        chunk_shape: [3, 3],
-        data_type: 'float64',
+        chunkShape: [3, 3],
+        dtype: 'float64',
       })
 
       // Set all elements to 42.0 with SAB
@@ -940,8 +940,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store1 = zarr.root()
       const arr1 = await zarr.create(store1, {
         shape: [4, 4],
-        chunk_shape: [2, 2],
-        data_type: 'float32',
+        chunkShape: [2, 2],
+        dtype: 'float32',
       })
       await setWorker(arr1, null, {
         data: new Float32Array(data),
@@ -953,8 +953,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store2 = zarr.root()
       const arr2 = await zarr.create(store2, {
         shape: [4, 4],
-        chunk_shape: [2, 2],
-        data_type: 'float32',
+        chunkShape: [2, 2],
+        dtype: 'float32',
       })
       await setWorker(arr2, null, {
         data: new Float32Array(data),
@@ -991,8 +991,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
         const store = zarr.root()
         const arr = await zarr.create(store, {
           shape: [3],
-          chunk_shape: [3],
-          data_type: dtype,
+          chunkShape: [3],
+          dtype: dtype,
         })
 
         await zarr.set(arr, null, {
@@ -1052,8 +1052,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [...shape],
-        chunk_shape: [...chunkShape],
-        data_type: 'uint16',
+        chunkShape: [...chunkShape],
+        dtype: 'uint16',
       })
 
       // Fill with sequential values
@@ -1144,8 +1144,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [...shape],
-        chunk_shape: [...chunkShape],
-        data_type: 'uint16',
+        chunkShape: [...chunkShape],
+        dtype: 'uint16',
       })
 
       // Fill with unique values (i + 1 so no zeros)
@@ -1224,8 +1224,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [...shape],
-        chunk_shape: [...chunkShape],
-        data_type: 'int32',
+        chunkShape: [...chunkShape],
+        dtype: 'int32',
       })
 
       const data = new Int32Array(totalSize)
@@ -1281,8 +1281,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [...shape],
-        chunk_shape: [...chunkShape],
-        data_type: 'uint16',
+        chunkShape: [...chunkShape],
+        dtype: 'uint16',
       })
 
       // Fill with a pattern that makes corruption obvious
@@ -1379,8 +1379,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [...shape],
-        chunk_shape: [...chunkShape],
-        data_type: 'float32',
+        chunkShape: [...chunkShape],
+        dtype: 'float32',
       })
 
       const data = new Float32Array(totalSize)
@@ -1443,8 +1443,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [7],
-        chunk_shape: [3],
-        data_type: 'int32',
+        chunkShape: [3],
+        dtype: 'int32',
       })
 
       // Write full chunks manually (3 elements each)
@@ -1495,8 +1495,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: arrayShape,
-        chunk_shape: chunkShape,
-        data_type: 'float32',
+        chunkShape: chunkShape,
+        dtype: 'float32',
       })
 
       // Build expected output: sequential values in C-order
@@ -1593,8 +1593,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: arrayShape,
-        chunk_shape: chunkShape,
-        data_type: 'uint16',
+        chunkShape: chunkShape,
+        dtype: 'uint16',
       })
 
       // Build expected output
@@ -1711,8 +1711,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [4, 4],
-        chunk_shape: [2, 2],
-        data_type: 'int32',
+        chunkShape: [2, 2],
+        dtype: 'int32',
       })
 
       const data = new Int32Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
@@ -1740,8 +1740,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [4, 4],
-        chunk_shape: [2, 2],
-        data_type: 'int32',
+        chunkShape: [2, 2],
+        dtype: 'int32',
       })
 
       const data = new Int32Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
@@ -1783,8 +1783,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [4],
-        chunk_shape: [2],
-        data_type: 'int32',
+        chunkShape: [2],
+        dtype: 'int32',
       })
 
       await zarr.set(arr, null, {
@@ -1817,8 +1817,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [4],
-        chunk_shape: [2],
-        data_type: 'int32',
+        chunkShape: [2],
+        dtype: 'int32',
       })
 
       await zarr.set(arr, null, {
@@ -1871,8 +1871,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [4],
-        chunk_shape: [2],
-        data_type: 'int32',
+        chunkShape: [2],
+        dtype: 'int32',
       })
 
       await zarr.set(arr, null, {
@@ -1937,8 +1937,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [4, 4],
-        chunk_shape: [2, 2],
-        data_type: 'int32',
+        chunkShape: [2, 2],
+        dtype: 'int32',
       })
 
       const data = new Int32Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
@@ -1993,8 +1993,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
 
       const arr1 = await zarr.create(store.resolve('/arr1'), {
         shape: [4],
-        chunk_shape: [4],
-        data_type: 'int32',
+        chunkShape: [4],
+        dtype: 'int32',
       })
       await zarr.set(arr1, null, {
         data: new Int32Array([1, 2, 3, 4]),
@@ -2004,8 +2004,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
 
       const arr2 = await zarr.create(store.resolve('/arr2'), {
         shape: [4],
-        chunk_shape: [4],
-        data_type: 'int32',
+        chunkShape: [4],
+        dtype: 'int32',
       })
       await zarr.set(arr2, null, {
         data: new Int32Array([10, 20, 30, 40]),
@@ -2044,8 +2044,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store1 = zarr.root()
       const arr1 = await zarr.create(store1, {
         shape: [4],
-        chunk_shape: [4],
-        data_type: 'int32',
+        chunkShape: [4],
+        dtype: 'int32',
       })
       await zarr.set(arr1, null, {
         data: new Int32Array([1, 2, 3, 4]),
@@ -2056,8 +2056,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store2 = zarr.root()
       const arr2 = await zarr.create(store2, {
         shape: [4],
-        chunk_shape: [4],
-        data_type: 'int32',
+        chunkShape: [4],
+        dtype: 'int32',
       })
       await zarr.set(arr2, null, {
         data: new Int32Array([10, 20, 30, 40]),
@@ -2097,8 +2097,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [4, 4],
-        chunk_shape: [2, 2],
-        data_type: 'int32',
+        chunkShape: [2, 2],
+        dtype: 'int32',
       })
 
       const data = new Int32Array([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
@@ -2147,8 +2147,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [4],
-        chunk_shape: [4],
-        data_type: 'int32',
+        chunkShape: [4],
+        dtype: 'int32',
         codecs: [
           { name: 'bytes', configuration: { endian: 'little' } },
           { name: 'gzip', configuration: { level: 1 } },
@@ -2196,9 +2196,9 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [4],
-        chunk_shape: [2],
-        data_type: 'int32',
-        fill_value: 42,
+        chunkShape: [2],
+        dtype: 'int32',
+        fillValue: 42,
       })
 
       // Write data for only the first chunk, leave second as missing
@@ -2245,8 +2245,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [4],
-        chunk_shape: [2],
-        data_type: 'int32',
+        chunkShape: [2],
+        dtype: 'int32',
       })
       await zarr.set(arr, null, {
         data: new Int32Array([10, 20, 30, 40]),
@@ -2340,8 +2340,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [4],
-        chunk_shape: [2],
-        data_type: 'int32',
+        chunkShape: [2],
+        dtype: 'int32',
       })
       await zarr.set(arr, null, {
         data: new Int32Array([10, 20, 30, 40]),
@@ -2391,8 +2391,8 @@ test.describe('@fideus-labs/fizarrita — getWorker / setWorker', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [4],
-        chunk_shape: [2],
-        data_type: 'int32',
+        chunkShape: [2],
+        dtype: 'int32',
       })
       await zarr.set(arr, null, {
         data: new Int32Array([10, 20, 30, 40]),

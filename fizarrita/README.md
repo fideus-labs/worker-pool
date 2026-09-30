@@ -83,6 +83,88 @@ await setWorker(arr, [zarr.slice(2, 8)], newData, { pool })
 | `pool` | `WorkerPool` | **required** | Worker pool for codec operations |
 | `workerUrl` | `string \| URL` | built-in | URL of the codec worker script |
 | `useSharedArrayBuffer` | `boolean` | `false` | Use SharedArrayBuffer for intermediate buffers during partial updates |
+| `signal` | `AbortSignal` | — | Aborts the write: drops queued chunk tasks, cancels reads of chunks being partially updated |
+
+Like zarrita's `set`, a write is not transactional: chunks written before the
+signal fires stay written.
+
+### Selections
+
+`selection` is the same positional list `zarr.get` takes — `null`, integers,
+and `zarr.slice(...)` (whose bounds may be `bigint`s). zarrita's
+`zarr.select` builds one from dimension names:
+
+```ts
+// arr.dimensionNames -> ["time", "y", "x"]
+const frame = await getWorker(
+  arr,
+  zarr.select(arr, { time: 0, y: zarr.slice(0, 256) }),
+  { pool },
+)
+```
+
+Scalar arrays (`shape: []`) read and write like any other.
+
+### Supported arrays
+
+Zarr v3 arrays, and v2 arrays via the same conversion zarrita applies when it
+opens them: byte order from the `dtype`, `order: "F"` as a transpose, numcodecs
+filters and compressors under zarrita's `numcodecs.` codec names, and
+`fixedscaleoffset` as `scale_offset` + `cast_value`. Numeric data types only
+(`float16` where the runtime has `Float16Array`).
+
+**Sharded arrays** (`sharding_indexed`) read and write like any other.
+`arr.chunks` is the inner chunk shape, so selections, the chunk cache and
+`useSharedArrayBuffer` all work per inner chunk, and workers decode and
+encode inner chunks with the inner codecs.
+
+- *Reads:* the shard index is range-fetched once per shard and remembered
+  for the store's lifetime, and each inner chunk is one range request.
+  Wrapping the store in `zarr.withRangeCoalescing` batches the inner chunk
+  requests of one shard into fewer HTTP round-trips. As with zarrita, the
+  store needs `getRange` (`FetchStore` and `FileSystemStore` have it;
+  `zarr.open` refuses a sharded array on a store without).
+- *Writes* — which zarrita's own `set` refuses: a shard is rewritten as a
+  whole. Inner chunks the write covers are encoded on workers, in parallel;
+  the rest are copied from the shard as stored (which is read only when some
+  of it is kept); the index is rebuilt (`bytes` and `crc32c` index codecs);
+  and the shard is written by the last of its tasks to finish. Every inner
+  chunk the write touches is written, even one that is all fill value. Two
+  concurrent writes to the same shard race, the last one winning — as two
+  concurrent partial writes to one chunk do. A write drops fizarrita's
+  remembered index for the shard; zarrita's own `Array` remembers indexes
+  too and is not told, so read with `zarr.get` through a freshly opened
+  array after writing with `setWorker`.
+
+Stores wrapped with zarrita's store extensions (`zarr.withByteCaching`,
+`zarr.withRangeCoalescing`, `zarr.withConsolidatedMetadata`, or your own
+`zarr.defineStoreExtension`) work unchanged: chunk bytes are fetched through
+`arr.store` on the main thread. Array extensions (`zarr.defineArrayExtension`),
+which replace `arr.getChunk`, are bypassed — fizarrita fetches and decodes
+chunks itself.
+
+## Errors
+
+Failures are zarrita's structured errors, so the same checks work for
+`getWorker`/`setWorker` as for `zarr.get`/`zarr.set`:
+
+```ts
+try {
+  await getWorker(arr, selection, { pool })
+} catch (e) {
+  if (zarr.isZarritaError(e, 'CodecPipelineError')) {
+    // e.codec, e.direction, e.chunkPath — and e.cause, the codec's own error
+  } else if (zarr.isZarritaError(e, 'UnknownCodecError')) {
+    // e.codec is not registered in the worker's zarrita registry
+  } else if (zarr.isZarritaError(e, 'InvalidSelectionError')) {
+    // out of bounds, wrong rank, zero step
+  }
+}
+```
+
+A codec error is raised inside a worker; the worker reports it and it is
+rebuilt on the calling thread, with `chunkPath` added. Its `cause` carries the
+original message but not the original error object.
 
 ## SharedArrayBuffer
 
@@ -243,8 +325,8 @@ import * as zarr from 'zarrita'
 const store = new Map()
 const arr = await zarr.create(zarr.root(store).resolve('/data'), {
   shape: [1024, 1024],
-  chunk_shape: [256, 256],
-  data_type: 'int32',
+  chunkShape: [256, 256],
+  dtype: 'int32',
 })
 
 const pool = new WorkerPool(4)
@@ -264,8 +346,10 @@ Notes:
 - **`useSharedArrayBuffer` works in Node**, and needs no COOP/COEP headers there;
   `SharedArrayBuffer` is available unconditionally.
 - **Codec availability is zarrita's, not ours.** zarrita ships working `zstd`,
-  `blosc`, `lz4`, and `bytes` implementations; `gzip` and `crc32c` need a codec
-  registered from `numcodecs`, in the worker, via a
+  `blosc`, `lz4`, and `bytes` implementations; `gzip`, `zlib`, and `crc32c`
+  decode but do not encode (a write fails with a `CodecPipelineError`, as it
+  does in `zarr.set`) unless a codec is registered from `numcodecs`, in the
+  worker, via a
   [custom codec worker](#custom-codec-worker).
 
 ## Worker message protocol
@@ -277,7 +361,11 @@ The built-in codec worker handles four message types:
 | `init` | `init_ok` | Register codec metadata (once per worker per array config) |
 | `decode` | `decoded` | Decode raw bytes, transfer decoded ArrayBuffer back |
 | `decode_into` | `decode_into_ok` | Decode and write directly into SharedArrayBuffer |
-| `encode` | `encoded` | Encode chunk data, transfer encoded bytes back |
+| `encode` | `encoded` | Encode chunk data (C order, or the `stride` sent with it), transfer encoded bytes back |
+
+A failed request is answered with its usual response type carrying `error`, a
+message, and — when the failure was one of zarrita's structured errors —
+`errorInfo`, from which the calling thread rebuilds it.
 
 Codec metadata is deduplicated — each unique array configuration is sent to a
 worker only once, then cached by integer `metaId`.

@@ -40,12 +40,12 @@ const BLOSC = [
   },
 ]
 
-async function makeArray({ shape, chunk_shape, data_type = 'int32', codecs }) {
+async function makeArray({ shape, chunkShape, dtype = 'int32', codecs }) {
   const store = new Map()
   const arr = await zarr.create(zarr.root(store).resolve('/data'), {
     shape,
-    chunk_shape,
-    data_type,
+    chunkShape,
+    dtype,
     ...(codecs ? { codecs } : {}),
   })
   return arr
@@ -75,8 +75,8 @@ async function makeCountedArray() {
   const store = new CountingStore()
   const arr = await zarr.create(zarr.root(store).resolve('/data'), {
     shape: [8, 8],
-    chunk_shape: [4, 4],
-    data_type: 'int32',
+    chunkShape: [4, 4],
+    dtype: 'int32',
   })
   await zarr.set(arr, null, {
     data: Int32Array.from({ length: 64 }, (_, i) => i),
@@ -87,7 +87,7 @@ async function makeCountedArray() {
 }
 
 test('setWorker/getWorker round-trip a scalar fill', async () => {
-  const arr = await makeArray({ shape: [8, 8], chunk_shape: [4, 4] })
+  const arr = await makeArray({ shape: [8, 8], chunkShape: [4, 4] })
 
   await withPool(2, async (pool) => {
     await setWorker(arr, null, 42, { pool })
@@ -105,7 +105,7 @@ test('setWorker/getWorker round-trip a scalar fill', async () => {
 test('setWorker/getWorker round-trip full data through zstd', async () => {
   const arr = await makeArray({
     shape: [8, 8],
-    chunk_shape: [4, 4],
+    chunkShape: [4, 4],
     codecs: ZSTD,
   })
   const data = {
@@ -122,8 +122,8 @@ test('setWorker/getWorker round-trip full data through zstd', async () => {
 })
 
 test('results match zarrita’s own get/set', async () => {
-  const arr = await makeArray({ shape: [6, 10], chunk_shape: [4, 4] })
-  const reference = await makeArray({ shape: [6, 10], chunk_shape: [4, 4] })
+  const arr = await makeArray({ shape: [6, 10], chunkShape: [4, 4] })
+  const reference = await makeArray({ shape: [6, 10], chunkShape: [4, 4] })
   const data = {
     data: Int32Array.from({ length: 60 }, (_, i) => i * 3),
     shape: [6, 10],
@@ -142,7 +142,7 @@ test('results match zarrita’s own get/set', async () => {
 })
 
 test('partial selections read back correctly', async () => {
-  const arr = await makeArray({ shape: [8, 8], chunk_shape: [4, 4] })
+  const arr = await makeArray({ shape: [8, 8], chunkShape: [4, 4] })
   const data = {
     data: Int32Array.from({ length: 64 }, (_, i) => i),
     shape: [8, 8],
@@ -169,7 +169,7 @@ test('partial selections read back correctly', async () => {
 
 test('edge chunks read back at their true extent', async () => {
   // 5x7 over 4x4 chunks: the last row and column of chunks are partial.
-  const arr = await makeArray({ shape: [5, 7], chunk_shape: [4, 4] })
+  const arr = await makeArray({ shape: [5, 7], chunkShape: [4, 4] })
   const data = {
     data: Int32Array.from({ length: 35 }, (_, i) => i + 1),
     shape: [5, 7],
@@ -187,7 +187,7 @@ test('edge chunks read back at their true extent', async () => {
 test('SharedArrayBuffer path decodes straight into shared output', async () => {
   assert.notEqual(typeof SharedArrayBuffer, 'undefined')
 
-  const arr = await makeArray({ shape: [8, 8], chunk_shape: [4, 4], codecs: ZSTD })
+  const arr = await makeArray({ shape: [8, 8], chunkShape: [4, 4], codecs: ZSTD })
   const data = {
     data: Int32Array.from({ length: 64 }, (_, i) => i * 2),
     shape: [8, 8],
@@ -207,7 +207,7 @@ test('SharedArrayBuffer path decodes straight into shared output', async () => {
 })
 
 test('a chunk cache serves repeat reads without re-decoding', async () => {
-  const arr = await makeArray({ shape: [8, 8], chunk_shape: [4, 4], codecs: BLOSC })
+  const arr = await makeArray({ shape: [8, 8], chunkShape: [4, 4], codecs: BLOSC })
   const data = {
     data: Int32Array.from({ length: 64 }, (_, i) => i),
     shape: [8, 8],
@@ -231,9 +231,9 @@ test('a missing chunk comes back as the fill value', async () => {
   const store = new Map()
   const arr = await zarr.create(zarr.root(store).resolve('/data'), {
     shape: [8, 8],
-    chunk_shape: [4, 4],
-    data_type: 'int32',
-    fill_value: -1,
+    chunkShape: [4, 4],
+    dtype: 'int32',
+    fillValue: -1,
   })
 
   await withPool(2, async (pool) => {
@@ -248,7 +248,7 @@ test('a missing chunk comes back as the fill value', async () => {
 
 test('an explicit workerUrl is honoured, as a URL and as a string', async () => {
   for (const workerUrl of [NODE_CODEC_WORKER, NODE_CODEC_WORKER.href]) {
-    const arr = await makeArray({ shape: [8, 8], chunk_shape: [4, 4], codecs: ZSTD })
+    const arr = await makeArray({ shape: [8, 8], chunkShape: [4, 4], codecs: ZSTD })
     const data = {
       data: Int32Array.from({ length: 64 }, (_, i) => i + 1),
       shape: [8, 8],
@@ -364,8 +364,8 @@ async function makeAbortableArray() {
   const store = new AbortableStore()
   const arr = await zarr.create(zarr.root(store).resolve('/data'), {
     shape: [8, 8],
-    chunk_shape: [4, 4],
-    data_type: 'int32',
+    chunkShape: [4, 4],
+    dtype: 'int32',
   })
   const data = {
     data: Int32Array.from({ length: 64 }, (_, i) => i),
@@ -498,8 +498,8 @@ test('a decode failure rejects instead of hanging', { timeout: 15_000 }, async (
   const store = new Map()
   const arr = await zarr.create(zarr.root(store).resolve('/data'), {
     shape: [4, 4],
-    chunk_shape: [4, 4],
-    data_type: 'int32',
+    chunkShape: [4, 4],
+    dtype: 'int32',
     codecs: ZSTD,
   })
   // Not a zstd frame — the worker's decode will throw.
@@ -573,8 +573,8 @@ test('store options reach the metadata reads, not just the probe', async () => {
   const store = new CountingStore()
   const arr = await zarr.create(zarr.root(store).resolve('/data'), {
     shape: [8, 8],
-    chunk_shape: [4, 4],
-    data_type: 'int32',
+    chunkShape: [4, 4],
+    dtype: 'int32',
   })
   await zarr.set(arr, null, {
     data: Int32Array.from({ length: 64 }, (_, i) => i),
@@ -650,12 +650,12 @@ class GatedStore extends CountingStore {
   }
 }
 
-/** Populate 8x8 int32 0..63 at `/data` on `store`, chunked `chunk_shape`. */
-async function populate(store, chunk_shape) {
+/** Populate 8x8 int32 0..63 at `/data` on `store`, chunked `chunkShape`. */
+async function populate(store, chunkShape) {
   const arr = await zarr.create(zarr.root(store).resolve('/data'), {
     shape: [8, 8],
-    chunk_shape,
-    data_type: 'int32',
+    chunkShape,
+    dtype: 'int32',
   })
   const expected = Int32Array.from({ length: 64 }, (_, i) => i)
   await zarr.set(arr, null, { data: expected, shape: [8, 8], stride: [8, 1] })
@@ -839,8 +839,8 @@ test('a probe that fails transiently is retried, not memoised as a missed correc
   // memoising "no correction needed" would corrupt every later read.
   const arr = await zarr.create(zarr.root(store).resolve('/data'), {
     shape: [8, 8],
-    chunk_shape: [4, 8],
-    data_type: 'int32',
+    chunkShape: [4, 8],
+    dtype: 'int32',
   })
   const expected = Int32Array.from({ length: 64 }, (_, i) => i)
   await zarr.set(arr, null, { data: expected, shape: [8, 8], stride: [8, 1] })

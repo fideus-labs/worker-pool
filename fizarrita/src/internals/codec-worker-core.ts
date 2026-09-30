@@ -18,13 +18,17 @@
  *                -> { type: 'decode_into_ok', id }
  *                Worker decodes and writes directly into SharedArrayBuffer.
  *
- *   encode:      { type: 'encode', id, data: ArrayBuffer, metaId }
+ *   encode:      { type: 'encode', id, data: ArrayBuffer, metaId, stride? }
  *                -> { type: 'encoded', id, bytes: ArrayBuffer }
+ *
+ * A failed request is answered with its usual response type carrying
+ * `error` (a message) and, for zarrita's structured errors, `errorInfo`.
  */
 
+import { isZarritaError } from "zarrita"
 import type { Chunk, DataType } from "zarrita"
 
-import type { CodecChunkMeta, Projection } from "../types.js"
+import type { CodecChunkMeta, Projection, WorkerErrorInfo } from "../types.js"
 import { create_codec_pipeline } from "./codec-pipeline.js"
 import { compat_chunk, set_from_chunk_binary } from "./setter.js"
 import { get_ctr, get_strides } from "./util.js"
@@ -50,11 +54,13 @@ function fixEdgeChunkShapeStride<D extends DataType>(
     const expectedElements = actualChunkShape.reduce((a, b) => a * b, 1)
     const actualElements = (chunk.data as unknown as ArrayLike<unknown>).length
     if (actualElements === expectedElements) {
-      // Decoded size matches the actual edge shape — just fix shape/stride
+      // Decoded size matches the actual edge shape — just fix shape/stride,
+      // keeping the memory order the codecs decoded into (a transpose codec
+      // leaves the data in its own order, not C).
       return {
         data: chunk.data,
         shape: actualChunkShape,
-        stride: get_strides(actualChunkShape, "C"),
+        stride: get_strides(actualChunkShape, memoryOrder(chunk.stride)),
       }
     }
     if (actualElements > expectedElements) {
@@ -64,8 +70,9 @@ function fixEdgeChunkShapeStride<D extends DataType>(
       const src = chunk.data as any
       const Ctr = src.constructor as new (n: number) => typeof src
       const dst = new Ctr(expectedElements)
-      const srcStrides = get_strides(chunk.shape, "C")
-      copySubRegion(src, srcStrides, dst, actualChunkShape)
+      // Read through the decoded strides, which are not C-order when a
+      // transpose codec is in the chain; the copy itself is written in C order.
+      copySubRegion(src, chunk.stride, dst, actualChunkShape)
       return {
         data: dst as typeof chunk.data,
         shape: actualChunkShape,
@@ -86,7 +93,19 @@ function fixEdgeChunkShapeStride<D extends DataType>(
 }
 
 /**
- * Copy a sub-region from a padded C-order buffer into a compact destination.
+ * The axis permutation a set of strides lays memory out in, outermost axis
+ * first — `[0, 1, …]` for C order, `[…, 1, 0]` for F order. Ties (unit-length
+ * axes) keep their axis order, so a C-order chunk always reads as C.
+ */
+function memoryOrder(stride: readonly number[]): number[] {
+  return stride
+    .map((s, axis) => ({ s, axis }))
+    .sort((a, b) => b.s - a.s || a.axis - b.axis)
+    .map(({ axis }) => axis)
+}
+
+/**
+ * Copy a sub-region from a padded buffer into a compact C-order destination.
  *
  * For each dimension, copies only the first `subShape[d]` elements along
  * that axis from the source (which has strides `srcStrides`).
@@ -101,9 +120,11 @@ function copySubRegion(
   dim = 0,
 ): void {
   if (dim === subShape.length - 1) {
-    // Innermost dimension — copy contiguous run
+    // Innermost dimension — a contiguous run on the destination side, but
+    // strided on the source side when the chunk is not C-order.
+    const srcStride = srcStrides[dim]
     for (let i = 0; i < subShape[dim]; i++) {
-      dst[dstOffset + i] = src[srcOffset + i]
+      dst[dstOffset + i] = src[srcOffset + i * srcStride]
     }
     return
   }
@@ -157,6 +178,7 @@ function getOrCreatePipelineLegacy(meta: CodecChunkMeta) {
       data_type: meta.data_type,
       shape: meta.chunk_shape,
       codecs: meta.codecs,
+      fill_value: meta.fill_value,
     })
     pipelineByKey.set(key, pipeline)
   }
@@ -224,6 +246,12 @@ export type CodecWorkerMessage =
       data: ArrayBuffer
       metaId?: number
       meta?: CodecChunkMeta
+      /**
+       * Strides of `data`. Omitted means C order. A chunk decoded through a
+       * transpose codec and then modified in place keeps the transposed
+       * layout, and has to be encoded as laid out.
+       */
+      stride?: number[]
     }
 
 /** A reply to post back, with the buffers to hand over rather than copy. */
@@ -247,6 +275,36 @@ function responseTypeFor(requestType: CodecWorkerMessage["type"]): string {
 }
 
 /**
+ * A failure as reply fields: `error`, a message, and — for one of zarrita's
+ * structured errors — `errorInfo`, enough to rebuild it on the main thread
+ * (see `worker-rpc`), where `zarr.isZarritaError` can then recognise it. The
+ * error object itself cannot make the trip: structured clone keeps an Error's
+ * message but not its class.
+ */
+function describeError(error: unknown): {
+  error: string
+  errorInfo?: WorkerErrorInfo
+} {
+  if (!(error instanceof Error)) return { error: String(error) }
+  if (!isZarritaError(error)) return { error: error.message }
+  const info: WorkerErrorInfo = { tag: error._tag, message: error.message }
+  let message = error.message
+  if (isZarritaError(error, "CodecPipelineError")) {
+    info.direction = error.direction
+    info.codec = error.codec
+    const cause = error.cause
+    info.cause = cause instanceof Error ? cause.message : String(cause)
+    // The wrapper names the codec; the cause says what went wrong in it.
+    message = `${message}: ${info.cause}`
+  } else if (isZarritaError(error, "UnknownCodecError")) {
+    info.codec = error.codec
+  } else if (isZarritaError(error, "UnsupportedError")) {
+    info.feature = error.feature
+  }
+  return { error: message, errorInfo: info }
+}
+
+/**
  * Handle one codec worker request.
  *
  * Never rejects: a failure comes back as the request's normal response type
@@ -266,6 +324,7 @@ export async function handleCodecMessage(
         data_type: msg.meta.data_type,
         shape: msg.meta.chunk_shape,
         codecs: msg.meta.codecs,
+        fill_value: msg.meta.fill_value,
       })
       pipelineByMetaId.set(msg.metaId, pipeline)
       return { response: { type: "init_ok", id: msg.id }, transfer: [] }
@@ -353,7 +412,7 @@ export async function handleCodecMessage(
         msg.data.byteLength / Ctr.BYTES_PER_ELEMENT,
       )
       const shape = meta.chunk_shape
-      const stride = get_strides(shape, "C")
+      const stride = msg.stride ?? get_strides(shape, "C")
 
       const chunk = { data, shape, stride } as Chunk<DataType>
       const encoded = await pipeline.encode(chunk)
@@ -388,7 +447,7 @@ export async function handleCodecMessage(
       response: {
         type: responseTypeFor(msg.type),
         id: msg.id,
-        error: error instanceof Error ? error.message : String(error),
+        ...describeError(error),
       },
       transfer: [],
     }

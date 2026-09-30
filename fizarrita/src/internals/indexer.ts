@@ -8,36 +8,34 @@
  * Self-contained — no deep imports from zarrita.
  */
 
+import { InvalidSelectionError } from 'zarrita'
 import type { Indices, Slice } from 'zarrita'
 
 // ---------------------------------------------------------------------------
 // Helpers
+//
+// Selection errors are zarrita's own `InvalidSelectionError`, so a bad
+// selection fails `getWorker`/`setWorker` exactly as it fails `zarr.get`/
+// `zarr.set` — recognisable with `zarr.isZarritaError(e, 'InvalidSelectionError')`.
 // ---------------------------------------------------------------------------
-
-export class IndexError extends Error {
-  constructor(msg: string) {
-    super(msg)
-    this.name = 'IndexError'
-  }
-}
 
 function err_too_many_indices(
   selection: (number | Slice)[],
   shape: readonly number[],
 ): never {
-  throw new IndexError(
+  throw new InvalidSelectionError(
     `too many indicies for array; expected ${shape.length}, got ${selection.length}`,
   )
 }
 
 function err_boundscheck(dim_len: number): never {
-  throw new IndexError(
+  throw new InvalidSelectionError(
     `index out of bounds for dimension with length ${dim_len}`,
   )
 }
 
 function err_negative_step(): never {
-  throw new IndexError('only slices with step >= 1 are supported')
+  throw new InvalidSelectionError('only slices with step >= 1 are supported')
 }
 
 function check_selection_length(
@@ -53,22 +51,34 @@ function check_selection_length(
 // Slice utilities
 // ---------------------------------------------------------------------------
 
-export function slice(stop: number | null): Slice
+/** A bigint bound as a number, refusing one a number cannot hold exactly. */
+function to_int(value: bigint | number | null): number | null {
+  if (typeof value !== 'bigint') return value
+  if (value > Number.MAX_SAFE_INTEGER || value < Number.MIN_SAFE_INTEGER) {
+    throw new InvalidSelectionError(
+      `Cannot safely convert ${value} to a number. Value exceeds Number.MAX_SAFE_INTEGER.`,
+    )
+  }
+  return Number(value)
+}
+
+/** Build a {@link Slice}. Like zarrita's `slice`, bounds may be bigints. */
+export function slice(stop: bigint | number | null): Slice
 export function slice(
-  start: number | null,
-  stop?: number | null,
-  step?: number | null,
+  start: bigint | number | null,
+  stop?: bigint | number | null,
+  step?: bigint | number | null,
 ): Slice
 export function slice(
-  start: number | null,
-  stop?: number | null,
-  step: number | null = null,
+  start: bigint | number | null,
+  stop?: bigint | number | null,
+  step: bigint | number | null = null,
 ): Slice {
   if (stop === undefined) {
     stop = start
     start = null
   }
-  return { start, stop, step }
+  return { start: to_int(start), stop: to_int(stop), step: to_int(step) }
 }
 
 /**
@@ -79,7 +89,7 @@ export function slice_indices(
   { start, stop, step }: Slice,
   length: number,
 ): Indices {
-  if (step === 0) throw new Error('slice step cannot be zero')
+  if (step === 0) throw new InvalidSelectionError('slice step cannot be zero')
   step = step ?? 1
   const step_is_negative = step < 0
   const [lower, upper] = step_is_negative ? [-1, length - 1] : [0, length]
@@ -126,7 +136,14 @@ function* range(start: number, stop?: number, step = 1): Iterable<number> {
 function* product<T extends Iterable<unknown>[]>(
   ...iterables: T
 ): IterableIterator<unknown[]> {
-  if (iterables.length === 0) return
+  // The product of no iterables is a single empty tuple, not nothing: a
+  // zero-dimensional (scalar) array has exactly one chunk, at coordinates
+  // `[]`, and the indexer has to visit it. (zarrita's own `product` yields
+  // nothing here and special-cases scalar arrays in `get`/`set` instead.)
+  if (iterables.length === 0) {
+    yield []
+    return
+  }
   const iterators = iterables.map((it) => it[Symbol.iterator]())
   const results = iterators.map((it) => it.next())
   if (results.some((r) => r.done)) {

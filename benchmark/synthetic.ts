@@ -35,8 +35,8 @@ export async function createSyntheticArray(config: SyntheticConfig): Promise<{
   const store = zarr.root()
   const arr = await zarr.create(store, {
     shape: config.shape,
-    chunk_shape: config.chunkShape,
-    data_type: config.dtype as DataType,
+    chunkShape: config.chunkShape,
+    dtype: config.dtype as DataType,
   })
 
   const totalSize = config.shape.reduce((a, b) => a * b, 1)

@@ -89,21 +89,75 @@ function set_scalar_binary(
 // set_from_chunk_binary
 // ---------------------------------------------------------------------------
 
+/**
+ * Find the selection that is one unbroken run of memory on both sides, which
+ * the caller can copy with a single `set` — ported from zarrita 0.7.4.
+ *
+ * The run exists when each remaining dimension is a step-1 slice and each
+ * stride is the product of the lengths inside it, checked from the innermost
+ * dimension outward. The test is on the strides, so a transposed chunk fails
+ * it and falls to the element-by-element path, which is always correct.
+ *
+ * Returns the size of the run and its start offset on each side (in
+ * elements), or `null` when the caller must recurse.
+ */
+function contiguous_span(
+  projections: Projection[],
+  dest_stride: number[],
+  src_stride: number[],
+): { size: number; dest_offset: number; src_offset: number } | null {
+  // A dropped dimension leaves the two sides at different ranks, so the
+  // strides no longer line up with the projections. The recursion removes
+  // those dimensions first.
+  if (
+    projections.length !== dest_stride.length ||
+    projections.length !== src_stride.length
+  ) {
+    return null
+  }
+  let size = 1
+  let dest_offset = 0
+  let src_offset = 0
+  for (let i = projections.length - 1; i >= 0; i--) {
+    const proj = projections[i]
+    if (proj.from === null || proj.to === null) return null
+    if (dest_stride[i] !== size || src_stride[i] !== size) return null
+    const [from, to, step] = proj.to as Indices
+    const [sfrom, , sstep] = proj.from as Indices
+    if (step !== 1 || sstep !== 1) return null
+    dest_offset += size * from
+    src_offset += size * sfrom
+    size *= indices_len(from, to, step)
+  }
+  return { size, dest_offset, src_offset }
+}
+
 export function set_from_chunk_binary(
   dest: { data: Uint8Array; stride: number[] },
   src: { data: Uint8Array; stride: number[] },
   bytes_per_element: number,
   projections: Projection[],
 ): void {
+  const span = contiguous_span(projections, dest.stride, src.stride)
+  if (span !== null) {
+    const offset = span.src_offset * bytes_per_element
+    dest.data.set(
+      src.data.subarray(offset, offset + span.size * bytes_per_element),
+      span.dest_offset * bytes_per_element,
+    )
+    return
+  }
   const [proj, ...projs] = projections
   const [dstride, ...dstrides] = dest.stride
   const [sstride, ...sstrides] = src.stride
 
   if (proj.from === null) {
     if (projs.length === 0) {
+      // The last axis has stride 1 only in a C-contiguous chunk; a transpose
+      // order can put a different axis there. (zarrita 0.7.4, #445.)
       dest.data.set(
         src.data.subarray(0, bytes_per_element),
-        (proj.to as number) * bytes_per_element,
+        dstride * (proj.to as number) * bytes_per_element,
       )
       return
     }
@@ -122,7 +176,7 @@ export function set_from_chunk_binary(
   }
   if (proj.to === null) {
     if (projs.length === 0) {
-      const offset = (proj.from as number) * bytes_per_element
+      const offset = sstride * (proj.from as number) * bytes_per_element
       dest.data.set(src.data.subarray(offset, offset + bytes_per_element), 0)
       return
     }
@@ -145,15 +199,8 @@ export function set_from_chunk_binary(
   const len = indices_len(from, to, step)
 
   if (projs.length === 0) {
-    if (step === 1 && sstep === 1 && dstride === 1 && sstride === 1) {
-      const offset = sfrom * bytes_per_element
-      const size = len * bytes_per_element
-      dest.data.set(
-        src.data.subarray(offset, offset + size),
-        from * bytes_per_element,
-      )
-      return
-    }
+    // Not one run of memory (a contiguous last dimension was caught by
+    // contiguous_span above), so copy each element.
     for (let i = 0; i < len; i++) {
       const offset = sstride * (sfrom + sstep * i) * bytes_per_element
       dest.data.set(
