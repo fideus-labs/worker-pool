@@ -412,12 +412,16 @@ export async function setWorker<D extends DataType>(
           if (signal?.aborted) {
             throw signal.reason
           }
-          await arr.store.set(
-            shard.path as `/${string}`,
-            assemble_shard(parts, sharding),
-          )
-          // Readers remember shard indexes; this one has just changed.
-          forget_shard_index(arr.store, shard.path)
+          try {
+            await arr.store.set(
+              shard.path as `/${string}`,
+              assemble_shard(parts, sharding),
+            )
+          } finally {
+            // Readers remember shard indexes, and this one may have changed —
+            // also when the store rejected after writing some or all of it.
+            forget_shard_index(arr.store, shard.path)
+          }
         }),
       )
     }

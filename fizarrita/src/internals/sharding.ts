@@ -458,7 +458,23 @@ export function createShardedChunkSource<Store extends Readable>(
         if (index === null) return undefined
         const entry = index_entry(index, local, path)
         if (entry === null) return undefined
-        return getRange(path as `/${string}`, entry, storeOpts as GetOptions)
+        const bytes = await getRange(
+          path as `/${string}`,
+          entry,
+          storeOpts as GetOptions,
+        )
+        // The shard's size is not known here, but the index has promised a
+        // chunk of `entry.length` bytes at `entry.offset`: a range that comes
+        // back short, or not at all, is an index that disagrees with its
+        // shard — not a chunk to decode, nor a missing one to fill in.
+        if (!bytes || bytes.length !== entry.length) {
+          throw new InvalidMetadataError(
+            `Shard ${path} index entry for inner chunk [${local}] promises ` +
+              `${entry.length} bytes at offset ${entry.offset}; the store ` +
+              `returned ${bytes ? bytes.length : 'none'}`,
+          )
+        }
+        return bytes
       },
     }
   }

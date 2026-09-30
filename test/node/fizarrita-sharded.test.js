@@ -427,6 +427,23 @@ test('a corrupt inner chunk is reported against its shard', async () => {
   })
 })
 
+test('an index entry past the shard, read by range, is invalid metadata', async () => {
+  const store = new RangeStore()
+  const { arr } = await buildSharded(store, GEOMETRY)
+  // Inner chunk (0,0)'s offset, in the index at the shard's end: the range
+  // the index promises then runs off the shard, and comes back short.
+  const shard = store.get('/data/c/0/0')
+  new DataView(shard.buffer, shard.byteOffset).setBigUint64(shard.length - 68, BigInt(shard.length - 8), true)
+
+  await withPool(1, async (pool) => {
+    await assert.rejects(getWorker(arr, null, { pool }), (error) => {
+      assert.ok(zarr.isZarritaError(error, 'InvalidMetadataError'), String(error))
+      assert.match(error.message, /promises 64 bytes/)
+      return true
+    })
+  })
+})
+
 test('an index entry beyond safe-integer range is invalid metadata', async () => {
   const store = new RangeStore()
   const { arr } = await buildSharded(store, GEOMETRY)
@@ -717,6 +734,39 @@ test('a stored shard shorter than its index is invalid metadata', async () => {
     await assert.rejects(setWorker(arr, [0, 0], 1, { pool }), (error) =>
       zarr.isZarritaError(error, 'InvalidMetadataError') && /shorter than/.test(error.message),
     )
+  })
+})
+
+test('a shard write the store rejects still forgets the remembered index', async () => {
+  let armed = false
+  class WriteThenFail extends RangeStore {
+    set(key, value) {
+      super.set(key, value)
+      if (armed && key.includes('/c/')) throw new Error('lost the acknowledgement')
+      return this
+    }
+  }
+  const store = new WriteThenFail()
+  const { arr, expected } = await buildSharded(store, { ...GEOMETRY, innerCodecs: ZSTD })
+  armed = true
+  const indexRequests = () => store.ranges.filter((r) => 'suffixLength' in r && r.key === '/data/c/0/0').length
+  const patch = Int32Array.from({ length: 64 }, (_, i) => -i)
+  const after = withPatch(expected, [10, 12], [0, 0], [8, 8], patch)
+
+  await withPool(2, async (pool) => {
+    await getWorker(arr, null, { pool })
+    assert.equal(indexRequests(), 1)
+
+    // The store keeps the bytes but reports failure.
+    await assert.rejects(
+      setWorker(arr, [zarr.slice(0, 8), zarr.slice(0, 8)], { data: patch, shape: [8, 8], stride: [8, 1] }, { pool }),
+      /lost the acknowledgement/,
+    )
+
+    // The next read must not trust the old index against the new bytes.
+    const result = await getWorker(arr, null, { pool })
+    assert.equal(indexRequests(), 2, 'the index was fetched afresh')
+    assert.deepEqual(Array.from(result.data), Array.from(after))
   })
 })
 
