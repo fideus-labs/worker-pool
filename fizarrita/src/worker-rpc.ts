@@ -15,7 +15,6 @@ import type {
 import {
   CodecPipelineError,
   InvalidMetadataError,
-  isZarritaError,
   UnknownCodecError,
   UnsupportedError,
 } from 'zarrita'
@@ -58,23 +57,7 @@ function reviveError(message: string, info?: WorkerErrorInfo): Error {
   return new Error(message)
 }
 
-/**
- * A codec failure pinned to the chunk it happened on. The worker knows the
- * codec but not which chunk it was decoding; the caller knows the chunk. The
- * result is what `zarr.get` would throw, plus `chunkPath` — any other error
- * comes back as it went in.
- */
-export function atChunk(error: unknown, chunkPath: string): unknown {
-  if (isZarritaError(error, 'CodecPipelineError') && !error.chunkPath) {
-    return new CodecPipelineError({
-      direction: error.direction,
-      codec: error.codec,
-      chunkPath,
-      cause: error.cause,
-    })
-  }
-  return error
-}
+export { atChunk } from './internals/errors.js'
 
 /**
  * Per-worker dispatcher. Installs a single persistent `message` and `error`
@@ -156,11 +139,26 @@ const metaKeyToId = new Map<string, number>()
 const metaIdToMeta = new Map<number, CodecChunkMeta>()
 
 /**
+ * The dedup key of a codec metadata object. `JSON.stringify` alone would
+ * throw on a bigint fill value and write `NaN` and `null` the same, so those
+ * are spelled out; the key is never parsed back.
+ */
+function metaKey(meta: CodecChunkMeta): string {
+  return JSON.stringify(meta, (_, value) =>
+    typeof value === 'bigint'
+      ? `${value}n`
+      : typeof value === 'number' && !Number.isFinite(value)
+        ? String(value)
+        : value,
+  )
+}
+
+/**
  * Get or create a stable metaId for the given codec metadata.
- * Uses JSON.stringify as the dedup key — called once per unique array config.
+ * Keyed by its serialisation — called once per unique array config.
  */
 export function getMetaId(meta: CodecChunkMeta): number {
-  const key = JSON.stringify(meta)
+  const key = metaKey(meta)
   let id = metaKeyToId.get(key)
   if (id === undefined) {
     id = nextMetaId++

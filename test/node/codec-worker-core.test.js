@@ -7,7 +7,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { handleCodecMessage } from '../../fizarrita/dist/index.js'
+import { registry } from 'zarrita'
+
+import { getMetaId, handleCodecMessage } from '../../fizarrita/dist/index.js'
 
 const BYTES_META = {
   data_type: 'int32',
@@ -221,6 +223,57 @@ test('encode honours the stride the chunk is laid out in', async () => {
   const fromF = await encode([1, 3, 2, 4], [1, 2])
   assert.deepEqual(Array.from(fromC), [1, 3, 2, 4])
   assert.deepEqual(Array.from(fromF), Array.from(fromC))
+})
+
+test('codecs are configured with the array\u2019s typed fill value, as by zarrita', async () => {
+  // A codec that records the metadata it was built with.
+  const seen = []
+  registry.set('fizarrita-test-meta-probe', async () => ({
+    fromConfig(_config, meta) {
+      seen.push(meta)
+      return {
+        kind: 'bytes_to_bytes',
+        encode: (bytes) => bytes,
+        decode: (bytes) => bytes,
+      }
+    },
+  }))
+  const metaId = freshMetaId()
+  await handleCodecMessage({
+    type: 'init',
+    id: 16,
+    metaId,
+    meta: {
+      data_type: 'int64',
+      chunk_shape: [2],
+      codecs: [
+        { name: 'bytes', configuration: { endian: 'little' } },
+        { name: 'fizarrita-test-meta-probe', configuration: {} },
+      ],
+      fill_value: 5n,
+    },
+  })
+  const reply = await handleCodecMessage({
+    type: 'decode',
+    id: 17,
+    bytes: new BigInt64Array([1n, 2n]).buffer,
+    metaId,
+  })
+  assert.equal(reply.response.error, undefined)
+  assert.deepEqual(Array.from(new BigInt64Array(reply.response.data)), [1n, 2n])
+  assert.equal(seen.length, 1)
+  assert.equal(seen[0].dataType, 'int64')
+  assert.equal(seen[0].fillValue, 5n)
+  assert.deepEqual(seen[0].shape, [2])
+})
+
+test('metaIds tell fill values apart, bigint and non-finite ones included', async () => {
+  const base = { data_type: 'int64', chunk_shape: [2], codecs: [] }
+  assert.equal(getMetaId({ ...base, fill_value: 1n }), getMetaId({ ...base, fill_value: 1n }))
+  assert.notEqual(getMetaId({ ...base, fill_value: 1n }), getMetaId({ ...base, fill_value: 2n }))
+  const floats = { data_type: 'float32', chunk_shape: [2], codecs: [] }
+  assert.notEqual(getMetaId({ ...floats, fill_value: NaN }), getMetaId({ ...floats, fill_value: null }))
+  assert.notEqual(getMetaId({ ...floats, fill_value: Infinity }), getMetaId({ ...floats, fill_value: -Infinity }))
 })
 
 test('the node worker entry refuses to run on the main thread', async () => {

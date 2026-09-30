@@ -21,6 +21,7 @@ import type { CodecMetadata, GetOptions, Readable } from 'zarrita'
 
 import { separateSignal, untilAborted } from './abort.js'
 import { create_codec_pipeline } from './codec-pipeline.js'
+import { atChunk } from './errors.js'
 import { byteswap_inplace, system_is_little_endian } from './util.js'
 
 /** Name of the sharding codec in a v3 array's `codecs` list. */
@@ -436,7 +437,14 @@ export function createShardedChunkSource<Store extends Readable>(
           range,
           shared as GetOptions,
         )
-        return bytes ? decode_index(layout, bytes) : null
+        if (!bytes) return null
+        try {
+          return await decode_index(layout, bytes)
+        } catch (error) {
+          // An index codec that threw: the same structured error an inner
+          // chunk's codec would raise, naming the shard.
+          throw atChunk(error, shard_path)
+        }
       })()
       indexes.set(shard_path, promise)
       const forget = () => {

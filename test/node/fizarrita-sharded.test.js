@@ -461,6 +461,45 @@ test('an index entry beyond safe-integer range is invalid metadata', async () =>
   })
 })
 
+test('an index codec that fails names the shard, on read and on write', async () => {
+  // A bytes-to-bytes index codec that cannot decode. Registered in this
+  // process: the shard index is decoded on the calling thread, not a worker.
+  zarr.registry.set('fizarrita-test-bad-index', async () => ({
+    fromConfig() {
+      return {
+        kind: 'bytes_to_bytes',
+        encode: (bytes) => bytes,
+        decode() {
+          throw new Error('bad index')
+        },
+        computeEncodedSize: (n) => n,
+      }
+    },
+  }))
+  const store = new RangeStore()
+  const { arr } = await buildSharded(store, {
+    ...GEOMETRY,
+    indexCodecs: [
+      { name: 'bytes', configuration: { endian: 'little' } },
+      { name: 'fizarrita-test-bad-index', configuration: {} },
+    ],
+  })
+  const isIndexFailure = (error) => {
+    assert.ok(zarr.isZarritaError(error, 'CodecPipelineError'), String(error))
+    assert.equal(error.codec, 'fizarrita-test-bad-index')
+    assert.equal(error.direction, 'decode')
+    assert.match(error.chunkPath, /^\/data\/c\/\d\/\d$/)
+    assert.equal(error.cause.message, 'bad index')
+    return true
+  }
+
+  await withPool(1, async (pool) => {
+    await assert.rejects(getWorker(arr, null, { pool }), isIndexFailure)
+    // A partial write reads the shard to keep the rest of it.
+    await assert.rejects(setWorker(arr, [0, 0], 1, { pool }), isIndexFailure)
+  })
+})
+
 test('a shard shape the inner chunks do not divide is invalid metadata', async () => {
   const store = new RangeStore()
   await buildSharded(store, { ...GEOMETRY, shardShape: [8, 8], chunkShape: [4, 4] })

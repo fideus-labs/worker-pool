@@ -25,6 +25,7 @@ interface ChunkMetadata<D extends DataType> {
   data_type: D
   shape: number[]
   codecs: CodecMetadata[]
+  fill_value?: Scalar<D> | null
 }
 
 /**
@@ -100,16 +101,15 @@ async function load_codecs<D extends DataType>(chunk_meta: ChunkMetadata<D>) {
   let array_to_bytes: Named<ArrayToBytesCodec<D>> | undefined
   const bytes_to_bytes: Named<BytesToBytesCodec>[] = []
 
-  // The data type seen by each codec. Array-to-array codecs like cast_value
-  // change it between the array's declared type and what is stored, and the
-  // codecs after them must be built for the stored type. The fill value is
-  // not needed to encode or decode a chunk — the caller fills missing chunks
-  // itself — so it is not shipped to the worker.
+  // The metadata seen by each codec, as zarrita configures codecs: the data
+  // type and fill value. Array-to-array codecs like cast_value change both
+  // between the array's declared type and what is stored, and the codecs
+  // after them must be built for the stored type.
   let current_meta: CodecChunkMetadata = {
     dataType: chunk_meta.data_type,
     shape: chunk_meta.shape,
     codecs: chunk_meta.codecs,
-    fillValue: null,
+    fillValue: chunk_meta.fill_value ?? null,
   }
 
   for await (const { CodecClass, meta } of promises) {

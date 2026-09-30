@@ -221,7 +221,12 @@ export async function readArrayMetadata<
         shardingCodec.configuration,
       )
       return {
-        codecMeta: { data_type: metadata.data_type, chunk_shape, codecs },
+        codecMeta: {
+          data_type: metadata.data_type,
+          chunk_shape,
+          codecs,
+          fill_value: fillValue,
+        },
         encodeChunkKey,
         fillValue,
         sharding,
@@ -232,6 +237,7 @@ export async function readArrayMetadata<
         data_type: metadata.data_type,
         chunk_shape: grid_chunk_shape,
         codecs: metadata.codecs,
+        fill_value: fillValue,
       },
       encodeChunkKey,
       fillValue,
@@ -254,6 +260,7 @@ export async function readArrayMetadata<
           codecs.length > 0
             ? codecs
             : [{ name: "bytes", configuration: { endian: "little" } }],
+        fill_value: arr.fillValue,
       },
       encodeChunkKey: create_chunk_key_encoder({
         name: "v2",
@@ -269,6 +276,7 @@ export async function readArrayMetadata<
       data_type: arr.dtype,
       chunk_shape: arr.chunks,
       codecs: [{ name: "bytes", configuration: { endian: "little" } }],
+      fill_value: arr.fillValue,
     },
     encodeChunkKey: create_chunk_key_encoder({ name: "default" }),
     fillValue: arr.fillValue,
@@ -479,6 +487,7 @@ async function probeDecompressedSize<D extends DataType>(
       data_type: codecMeta.data_type,
       shape: codecMeta.chunk_shape,
       codecs: codecMeta.codecs,
+      fill_value: codecMeta.fill_value,
     })
     const chunk = await pipeline.decode(rawBytes)
     const data = chunk.data as unknown as ArrayLike<unknown>

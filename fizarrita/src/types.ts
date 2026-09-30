@@ -6,7 +6,7 @@
  */
 
 import type { WorkerPool } from '@fideus-labs/worker-pool'
-import type { Chunk, CodecMetadata, DataType, Readable } from 'zarrita'
+import type { Chunk, CodecMetadata, DataType, Readable, Scalar } from 'zarrita'
 
 // ---------------------------------------------------------------------------
 // Codec chunk metadata — sent to the worker to reconstruct the codec pipeline
@@ -20,6 +20,13 @@ export interface CodecChunkMeta {
   data_type: DataType
   chunk_shape: number[]
   codecs: CodecMetadata[]
+  /**
+   * The array's fill value, as zarrita types it (bigint for int64/uint64,
+   * `NaN`/`Infinity` as numbers). Part of the metadata zarrita configures
+   * codecs with, so a codec in the worker sees what it would under
+   * `zarr.get`; `cast_value` forwards a converted one to the codecs after it.
+   */
+  fill_value?: Scalar<DataType> | null
 }
 
 // ---------------------------------------------------------------------------

@@ -178,6 +178,7 @@ function getOrCreatePipelineLegacy(meta: CodecChunkMeta) {
       data_type: meta.data_type,
       shape: meta.chunk_shape,
       codecs: meta.codecs,
+      fill_value: meta.fill_value,
     })
     pipelineByKey.set(key, pipeline)
   }
@@ -323,6 +324,7 @@ export async function handleCodecMessage(
         data_type: msg.meta.data_type,
         shape: msg.meta.chunk_shape,
         codecs: msg.meta.codecs,
+        fill_value: msg.meta.fill_value,
       })
       pipelineByMetaId.set(msg.metaId, pipeline)
       return { response: { type: "init_ok", id: msg.id }, transfer: [] }
