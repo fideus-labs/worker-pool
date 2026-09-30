@@ -488,8 +488,8 @@ test.describe('getWorker — validation probe rejects wrong candidate', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [12, 8],
-        chunk_shape: [4, 3],
-        data_type: 'int32',
+        chunkShape: [4, 3],
+        dtype: 'int32',
       })
 
       // Write data: 12×8 grid with known values
@@ -553,8 +553,8 @@ test.describe('getWorker — chunk shape auto-detection integration', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [6, 6],
-        chunk_shape: [3, 3],
-        data_type: 'int32',
+        chunkShape: [3, 3],
+        dtype: 'int32',
       })
 
       const data = new Int32Array([
@@ -602,8 +602,8 @@ test.describe('getWorker — chunk shape auto-detection integration', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [6, 6],
-        chunk_shape: [3, 6],
-        data_type: 'int32',
+        chunkShape: [3, 6],
+        dtype: 'int32',
       })
 
       const data = new Int32Array([
@@ -687,8 +687,8 @@ test.describe('getWorker — chunk shape auto-detection integration', () => {
       const store = zarr.root()
       const arr = await zarr.create(store, {
         shape: [6, 6],
-        chunk_shape: [3, 6],
-        data_type: 'int32',
+        chunkShape: [3, 6],
+        dtype: 'int32',
       })
 
       const data = new Int32Array([

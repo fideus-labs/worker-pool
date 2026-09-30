@@ -12,9 +12,16 @@ import type {
   WorkerLike,
   WorkerMessageEventLike,
 } from '@fideus-labs/worker-pool'
+import {
+  CodecPipelineError,
+  InvalidMetadataError,
+  isZarritaError,
+  UnknownCodecError,
+  UnsupportedError,
+} from 'zarrita'
 import type { Chunk, DataType, TypedArray } from 'zarrita'
 import { get_ctr } from './internals/util.js'
-import type { CodecChunkMeta, Projection } from './types.js'
+import type { CodecChunkMeta, Projection, WorkerErrorInfo } from './types.js'
 
 // ---------------------------------------------------------------------------
 // Persistent message dispatcher
@@ -23,6 +30,50 @@ import type { CodecChunkMeta, Projection } from './types.js'
 interface PendingRequest {
   resolve: (data: unknown) => void
   reject: (err: Error) => void
+}
+
+/**
+ * Rebuild a worker's failure as the error it was: one of zarrita's structured
+ * errors when the worker described one (see {@link WorkerErrorInfo}), so
+ * callers can branch on `zarr.isZarritaError(e, 'CodecPipelineError')` exactly
+ * as they would for `zarr.get`; a plain `Error` otherwise.
+ */
+function reviveError(message: string, info?: WorkerErrorInfo): Error {
+  switch (info?.tag) {
+    case 'CodecPipelineError':
+      return new CodecPipelineError({
+        direction: info.direction ?? 'decode',
+        codec: info.codec,
+        cause: new Error(info.cause),
+      })
+    case 'UnknownCodecError':
+      if (info.codec !== undefined) return new UnknownCodecError(info.codec)
+      break
+    case 'InvalidMetadataError':
+      return new InvalidMetadataError(info.message)
+    case 'UnsupportedError':
+      if (info.feature !== undefined) return new UnsupportedError(info.feature)
+      break
+  }
+  return new Error(message)
+}
+
+/**
+ * A codec failure pinned to the chunk it happened on. The worker knows the
+ * codec but not which chunk it was decoding; the caller knows the chunk. The
+ * result is what `zarr.get` would throw, plus `chunkPath` — any other error
+ * comes back as it went in.
+ */
+export function atChunk(error: unknown, chunkPath: string): unknown {
+  if (isZarritaError(error, 'CodecPipelineError') && !error.chunkPath) {
+    return new CodecPipelineError({
+      direction: error.direction,
+      codec: error.codec,
+      chunkPath,
+      cause: error.cause,
+    })
+  }
+  return error
 }
 
 /**
@@ -46,7 +97,7 @@ class WorkerDispatcher {
     this.pending.delete(id)
 
     if (event.data.error) {
-      req.reject(new Error(event.data.error))
+      req.reject(reviveError(event.data.error, event.data.errorInfo))
     } else {
       req.resolve(event.data)
     }
@@ -223,12 +274,16 @@ export async function workerDecode<D extends DataType>(
 
 /**
  * Send chunk data to a codec worker for encoding and return the encoded bytes.
+ *
+ * @param stride - Strides of `data`, when it is not laid out in C order (a
+ *   chunk decoded through a transpose codec and modified in place).
  */
 export async function workerEncode<D extends DataType>(
   worker: WorkerLike,
   data: TypedArray<D>,
   metaId: number,
   meta: CodecChunkMeta,
+  stride?: number[],
 ): Promise<Uint8Array> {
   const dispatcher = getDispatcher(worker)
   await ensureMeta(dispatcher, metaId)
@@ -249,7 +304,7 @@ export async function workerEncode<D extends DataType>(
 
   const response = await dispatcher.send(
     id,
-    { type: 'encode', id, data: transferBuffer, metaId },
+    { type: 'encode', id, data: transferBuffer, metaId, stride },
     [transferBuffer],
   ) as { bytes: ArrayBuffer }
 
@@ -272,6 +327,7 @@ export async function workerEncodeShared<D extends DataType>(
   data: TypedArray<D>,
   metaId: number,
   meta: CodecChunkMeta,
+  stride?: number[],
 ): Promise<Uint8Array> {
   const dispatcher = getDispatcher(worker)
   await ensureMeta(dispatcher, metaId)
@@ -291,7 +347,7 @@ export async function workerEncodeShared<D extends DataType>(
 
   const response = await dispatcher.send(
     id,
-    { type: 'encode', id, data: copy, metaId },
+    { type: 'encode', id, data: copy, metaId, stride },
     [copy],
   ) as { bytes: ArrayBuffer }
 

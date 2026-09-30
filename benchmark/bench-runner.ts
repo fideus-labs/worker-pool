@@ -7,7 +7,6 @@
 
 import * as zarr from 'zarrita'
 import type { DataType, Chunk, Array as ZarrArray, Readable, Mutable } from 'zarrita'
-import { FetchStore } from '@zarrita/storage'
 import { WorkerPool } from '@fideus-labs/worker-pool'
 import { getWorker, setWorker } from '@fideus-labs/fizarrita'
 import { createSyntheticArray } from './synthetic.js'
@@ -66,7 +65,7 @@ function checkAbort(): void {
 async function openRemoteArray(
   config: RemoteConfig,
 ): Promise<ZarrArray<DataType, Readable>> {
-  const store = new FetchStore(config.rootUrl)
+  const store = new zarr.FetchStore(config.rootUrl)
   const location = zarr.root(store)
   const arr = await zarr.open(location.resolve(config.arrayPath), {
     kind: 'array',

@@ -14,6 +14,7 @@ import type {
   WorkerPool,
   WorkerPoolTask,
 } from "@fideus-labs/worker-pool"
+import { UnsupportedError } from "zarrita"
 import type {
   Chunk,
   DataType,
@@ -27,108 +28,23 @@ import type {
 } from "zarrita"
 
 import { createCodecWorker } from "./create-worker.js"
+import { readArrayMetadata } from "./get-worker.js"
 import { BasicIndexer, type IndexerProjection } from "./internals/indexer.js"
 import { setter } from "./internals/setter.js"
 import {
   assertSharedArrayBufferAvailable,
-  create_chunk_key_encoder,
   createBuffer,
   get_ctr,
   get_strides,
 } from "./internals/util.js"
-import type { CodecChunkMeta, SetWorkerOptions } from "./types.js"
+import type { SetWorkerOptions } from "./types.js"
 import {
+  atChunk,
   getMetaId,
   workerDecode,
   workerEncode,
   workerEncodeShared,
 } from "./worker-rpc.js"
-
-/** Shared TextDecoder instance. */
-const decoder = new TextDecoder()
-
-// ---------------------------------------------------------------------------
-// Unified metadata reader — reads zarr.json once, returns everything needed
-// ---------------------------------------------------------------------------
-
-interface ArrayMetadata {
-  codecMeta: CodecChunkMeta
-  encodeChunkKey: (chunk_coords: number[]) => string
-  fillValue: Scalar<DataType> | null
-}
-
-async function readArrayMetadata<D extends DataType>(
-  arr: ZarrArray<D, Mutable>,
-): Promise<ArrayMetadata> {
-  const store = arr.store
-
-  // Try v3 first: read zarr.json
-  const v3Path = (
-    arr.path === "/" ? "/zarr.json" : `${arr.path}/zarr.json`
-  ) as `/${string}`
-  const v3Bytes = await store.get(v3Path)
-  if (v3Bytes) {
-    const metadata = JSON.parse(decoder.decode(v3Bytes))
-    return {
-      codecMeta: {
-        data_type: metadata.data_type,
-        chunk_shape: metadata.chunk_grid.configuration.chunk_shape,
-        codecs: metadata.codecs,
-      },
-      encodeChunkKey: create_chunk_key_encoder(metadata.chunk_key_encoding),
-      fillValue: metadata.fill_value ?? null,
-    }
-  }
-
-  // Try v2: read .zarray
-  const v2Path = (
-    arr.path === "/" ? "/.zarray" : `${arr.path}/.zarray`
-  ) as `/${string}`
-  const v2Bytes = await store.get(v2Path)
-  if (v2Bytes) {
-    const metadata = JSON.parse(decoder.decode(v2Bytes))
-    const codecs: Array<{
-      name: string
-      configuration: Record<string, unknown>
-    }> = []
-    if (metadata.order === "F") {
-      codecs.push({ name: "transpose", configuration: { order: "F" } })
-    }
-    if (metadata.compressor) {
-      const { id, ...configuration } = metadata.compressor
-      codecs.push({ name: id, configuration })
-    }
-    for (const { id, ...configuration } of metadata.filters ?? []) {
-      codecs.push({ name: id, configuration })
-    }
-    return {
-      codecMeta: {
-        data_type: arr.dtype,
-        chunk_shape: arr.chunks,
-        codecs:
-          codecs.length > 0
-            ? codecs
-            : [{ name: "bytes", configuration: { endian: "little" } }],
-      },
-      encodeChunkKey: create_chunk_key_encoder({
-        name: "v2",
-        configuration: { separator: metadata.dimension_separator ?? "." },
-      }),
-      fillValue: metadata.fill_value ?? null,
-    }
-  }
-
-  // Fallback: BytesCodec only, default v3 key encoding
-  return {
-    codecMeta: {
-      data_type: arr.dtype,
-      chunk_shape: arr.chunks,
-      codecs: [{ name: "bytes", configuration: { endian: "little" } }],
-    },
-    encodeChunkKey: create_chunk_key_encoder({ name: "default" }),
-    fillValue: null,
-  }
-}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -179,8 +95,8 @@ function is_total_slice(
  * const store = zarr.root(new Map())
  * const arr = await zarr.create(store, {
  *   shape: [100, 100],
- *   chunk_shape: [10, 10],
- *   data_type: 'float32',
+ *   chunkShape: [10, 10],
+ *   dtype: 'float32',
  * })
  *
  * try {
@@ -196,15 +112,36 @@ export async function setWorker<D extends DataType>(
   value: Scalar<D> | Chunk<D>,
   opts: SetWorkerOptions,
 ): Promise<void> {
-  const { pool, workerUrl } = opts
+  const { pool, workerUrl, signal } = opts
   const useShared = !!opts.useSharedArrayBuffer
+
+  // Not `throwIfAborted()` — see getWorker.
+  if (signal?.aborted) {
+    throw signal.reason
+  }
 
   if (useShared) {
     assertSharedArrayBufferAvailable()
   }
 
+  // Handed to every store read: the metadata, and existing chunks fetched for
+  // a partial update.
+  const storeOpts = signal ? { signal } : undefined
+
   // Read metadata from store — single read, single parse
-  const { codecMeta, encodeChunkKey, fillValue } = await readArrayMetadata(arr)
+  const { codecMeta, encodeChunkKey, fillValue, sharding } =
+    await readArrayMetadata(arr, storeOpts)
+
+  // As zarrita: a shard is rewritten as a whole, index and all, and neither
+  // implements that.
+  if (sharding) {
+    throw new UnsupportedError("set on sharded arrays")
+  }
+
+  // Checkpoint for stores that ignore the signal, before any chunk is touched.
+  if (signal?.aborted) {
+    throw signal.reason
+  }
 
   // Get stable metaId for the codec metadata
   const metaId = getMetaId(codecMeta)
@@ -238,6 +175,10 @@ export async function setWorker<D extends DataType>(
       const worker = workerSlot ?? createCodecWorker(workerUrl)
 
       let chunkData: TypedArray<D>
+      // The layout of `chunkData`: C order unless it was decoded through a
+      // transpose codec, which leaves the data in the codec's own order.
+      // Modifying it in place and encoding it must both use that layout.
+      let chunkDataStrides = chunkStrides
 
       if (is_total_slice(chunkSelection, chunkShape)) {
         // Totally replace this chunk — no need to fetch existing data
@@ -265,7 +206,10 @@ export async function setWorker<D extends DataType>(
         }
       } else {
         // Partial replacement — fetch and decode existing chunk first
-        const rawBytes = await arr.store.get(chunkPath as `/${string}`)
+        const rawBytes = await arr.store.get(
+          chunkPath as `/${string}`,
+          storeOpts,
+        )
 
         if (rawBytes) {
           // Decode existing chunk on worker
@@ -276,6 +220,7 @@ export async function setWorker<D extends DataType>(
               metaId,
               codecMeta,
             )
+            chunkDataStrides = decoded.stride
             if (useShared) {
               // Copy decoded data into a SAB-backed buffer for zero-transfer encode
               const buffer = createBuffer(
@@ -296,7 +241,7 @@ export async function setWorker<D extends DataType>(
             }
           } catch (error) {
             worker.terminate()
-            throw error
+            throw atChunk(error, chunkPath)
           }
         } else {
           // Missing chunk — start from fill value
@@ -315,7 +260,7 @@ export async function setWorker<D extends DataType>(
         const chunk = setter.prepare(
           chunkData,
           chunkShape.slice(),
-          chunkStrides.slice(),
+          chunkDataStrides.slice(),
         ) as Chunk<D>
         if (typeof value === "object" && value !== null) {
           setter.set_from_chunk(
@@ -335,22 +280,34 @@ export async function setWorker<D extends DataType>(
       // Encode the chunk on the worker
       try {
         const encode = useShared ? workerEncodeShared : workerEncode
-        const encoded = await encode<D>(worker, chunkData, metaId, codecMeta)
+        const encoded = await encode<D>(
+          worker,
+          chunkData,
+          metaId,
+          codecMeta,
+          chunkDataStrides,
+        )
+
+        // Last point to back out before this chunk is committed.
+        if (signal?.aborted) {
+          throw signal.reason
+        }
 
         // Write to store on main thread
         await arr.store.set(chunkPath as `/${string}`, encoded)
       } catch (error) {
         worker.terminate()
-        throw error
+        throw atChunk(error, chunkPath)
       }
 
       return { worker, result: undefined as void }
     })
   }
 
-  // Execute all tasks with bounded concurrency via WorkerPool
+  // Execute all tasks with bounded concurrency via WorkerPool, which drops
+  // still-queued tasks when the signal fires.
   if (tasks.length > 0) {
-    const { promise } = pool.runTasks(tasks)
+    const { promise } = pool.runTasks(tasks, null, { signal })
     await promise
   }
 }

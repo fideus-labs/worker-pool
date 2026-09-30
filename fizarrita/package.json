@@ -48,12 +48,11 @@
     "@fideus-labs/worker-pool": "workspace:^"
   },
   "peerDependencies": {
-    "zarrita": ">=0.6.0"
+    "zarrita": "^0.7.0"
   },
   "devDependencies": {
-    "@zarrita/storage": "^0.1.4",
     "typescript": "^5.8.2",
-    "zarrita": "^0.6.1"
+    "zarrita": "^0.7.5"
   },
   "repository": {
     "type": "git",

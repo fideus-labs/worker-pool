@@ -9,6 +9,7 @@
  *   - byteswap_inplace: in-place byte swapping for endianness
  */
 
+import { InvalidMetadataError, UnsupportedError } from 'zarrita'
 import type { DataType, TypedArrayConstructor } from 'zarrita'
 
 // ---------------------------------------------------------------------------
@@ -17,8 +18,9 @@ import type { DataType, TypedArrayConstructor } from 'zarrita'
 
 /**
  * Get the TypedArray constructor for a given DataType.
- * Supports all numeric types; string/object types are not supported in
- * worker-pool codec operations.
+ * Supports all numeric types (float16 where the runtime has `Float16Array`);
+ * bool, string and object types are not supported in worker-pool codec
+ * operations, and are refused with zarrita's `UnsupportedError`.
  */
 export function get_ctr<D extends DataType>(
   data_type: D,
@@ -33,12 +35,13 @@ export function get_ctr<D extends DataType>(
     uint16: Uint16Array,
     uint32: Uint32Array,
     uint64: globalThis.BigUint64Array,
+    float16: (globalThis as { Float16Array?: unknown }).Float16Array,
     float32: Float32Array,
     float64: Float64Array,
   } as Record<string, unknown>)[data_type as string]
 
   if (!ctr) {
-    throw new Error(`Unsupported data_type for worker codec: ${data_type}`)
+    throw new UnsupportedError(`data_type ${data_type} in worker codecs`)
   }
   return ctr
 }
@@ -116,7 +119,7 @@ export function create_chunk_key_encoder(
     const separator = encoding.configuration?.separator ?? '.'
     return (chunk_coords) => chunk_coords.join(separator) || '0'
   }
-  throw new Error(`Unknown chunk key encoding: ${encoding.name}`)
+  throw new InvalidMetadataError(`Unknown chunk key encoding: ${encoding.name}`)
 }
 
 // ---------------------------------------------------------------------------

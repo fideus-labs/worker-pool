@@ -11,9 +11,6 @@ importers:
       '@playwright/test':
         specifier: ^1.62.1
         version: 1.62.1
-      '@zarrita/storage':
-        specifier: ^0.1.4
-        version: 0.1.4
       chart.js:
         specifier: ^4.5.1
         version: 4.5.1
@@ -24,8 +21,8 @@ importers:
         specifier: ^6.4.3
         version: 6.4.3
       zarrita:
-        specifier: ^0.6.2
-        version: 0.6.2
+        specifier: ^0.7.5
+        version: 0.7.5
 
   fizarrita:
     dependencies:
@@ -33,15 +30,12 @@ importers:
         specifier: workspace:^
         version: link:..
     devDependencies:
-      '@zarrita/storage':
-        specifier: ^0.1.4
-        version: 0.1.4
       typescript:
         specifier: ^5.8.2
         version: 5.9.3
       zarrita:
-        specifier: ^0.6.1
-        version: 0.6.1
+        specifier: ^0.7.5
+        version: 0.7.5
 
 packages:
 
@@ -357,8 +351,8 @@ packages:
   '@types/estree@1.0.9':
     resolution: {integrity: sha512-GhdPgy1el4/ImP05X05Uw4cw2/M93BCUmnEvWZNStlCzEKME4Fkk+YpoA5OiHNQmoS7Cafb8Xa3Pya8m1Qrzeg==}
 
-  '@zarrita/storage@0.1.4':
-    resolution: {integrity: sha512-qURfJAQcQGRfDQ4J9HaCjGaj3jlJKc66bnRk6G/IeLUsM7WKyG7Bzsuf1EZurSXyc0I4LVcu6HaeQQ4d3kZ16g==}
+  '@zarrita/storage@0.2.0':
+    resolution: {integrity: sha512-855ZXqtnds7spnT8vNvD+MXa3QExP1m2GqShe8yt7uZXHnQLgJHgkpVwFjE1B0KDDRO0ki09hmk6OboTaIfPsQ==}
 
   chart.js@4.5.1:
     resolution: {integrity: sha512-GIjfiT9dbmHRiYi6Nl2yFCq7kkwdkp1W/lp2J99rX0yo9tgJGn3lKQATztIjb5tVtevcBtIdICNWqlq5+E8/Pw==}
@@ -441,12 +435,9 @@ packages:
     engines: {node: '>=14.17'}
     hasBin: true
 
-  unzipit@1.4.3:
-    resolution: {integrity: sha512-gsq2PdJIWWGhx5kcdWStvNWit9FVdTewm4SEG7gFskWs+XCVaULt9+BwuoBtJiRE8eo3L1IPAOrbByNLtLtIlg==}
-    engines: {node: '>=12'}
-
-  uzip-module@1.0.3:
-    resolution: {integrity: sha512-AMqwWZaknLM77G+VPYNZLEruMGWGzyigPK3/Whg99B3S6vGHuqsyl5ZrOv1UUF3paGK1U6PM0cnayioaryg/fA==}
+  unzipit@2.0.0:
+    resolution: {integrity: sha512-DVeVIWUZCAQPNzm5sB0hpsG1GygTTdBnzNtYYEpInkttx5evkyqRgZi6rTczoySqp8hO5jHVKzrH0f23X8FZLg==}
+    engines: {node: '>=18'}
 
   vite@6.4.3:
     resolution: {integrity: sha512-NTKlcQjlAK7MlQoyb6LgaqHc8sso/pVyUJYWMws3jg21uTJw/LddqIFPcPqP6PzpgbIcZyKI85sFE4HBrQDA8A==}
@@ -488,11 +479,8 @@ packages:
       yaml:
         optional: true
 
-  zarrita@0.6.1:
-    resolution: {integrity: sha512-YOMTW8FT55Rz+vadTIZeOFZ/F2h4svKizyldvPtMYSxPgSNcRkOzkxCsWpIWlWzB1I/LmISmi0bEekOhLlI+Zw==}
-
-  zarrita@0.6.2:
-    resolution: {integrity: sha512-8IV+2bWt5yiHNVK9GVEVK1tscpqDcJj8iz5cIKFOiWiWYUsK4V5njgMtnpkvKu6L7K+Og6zUShd8f+dwb6LvTA==}
+  zarrita@0.7.5:
+    resolution: {integrity: sha512-ZriOSEne+Wf2iuM0yjDZvUKpHNlug3dO7qJ6mAxXoOgsYV18DPOkAkwB9e0rf21bHcKcOffFuwoZwn5g6pvUeA==}
 
 snapshots:
 
@@ -660,10 +648,10 @@ snapshots:
 
   '@types/estree@1.0.9': {}
 
-  '@zarrita/storage@0.1.4':
+  '@zarrita/storage@0.2.0':
     dependencies:
       reference-spec-reader: 0.2.0
-      unzipit: 1.4.3
+      unzipit: 2.0.0
 
   chart.js@4.5.1:
     dependencies:
@@ -777,11 +765,7 @@ snapshots:
 
   typescript@5.9.3: {}
 
-  unzipit@1.4.3:
-    dependencies:
-      uzip-module: 1.0.3
-
-  uzip-module@1.0.3: {}
+  unzipit@2.0.0: {}
 
   vite@6.4.3:
     dependencies:
@@ -794,12 +778,7 @@ snapshots:
     optionalDependencies:
       fsevents: 2.3.3
 
-  zarrita@0.6.1:
+  zarrita@0.7.5:
     dependencies:
-      '@zarrita/storage': 0.1.4
-      numcodecs: 0.3.2
-
-  zarrita@0.6.2:
-    dependencies:
-      '@zarrita/storage': 0.1.4
+      '@zarrita/storage': 0.2.0
       numcodecs: 0.3.2

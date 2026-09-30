@@ -44,6 +44,7 @@ export {
   set_from_chunk_binary,
   setter,
 } from "./internals/setter.js"
+export type { ShardingInfo } from "./internals/sharding.js"
 export type { ChunkKeyEncoding } from "./internals/util.js"
 export {
   assertSharedArrayBufferAvailable,
@@ -60,6 +61,7 @@ export type {
   Indices,
   Projection,
   SetWorkerOptions,
+  WorkerErrorInfo,
 } from "./types.js"
 // Worker RPC helpers — for composing custom workers
 export {

@@ -155,6 +155,72 @@ test('a bad codec surfaces as an error reply, not a rejection', async () => {
   assert.equal(reply.response.type, 'decoded')
   assert.equal(reply.response.id, 10)
   assert.match(reply.response.error, /Unknown codec: no-such-codec/)
+  assert.equal(reply.response.errorInfo.tag, 'UnknownCodecError')
+  assert.equal(reply.response.errorInfo.codec, 'no-such-codec')
+})
+
+test('a codec that throws is reported as zarrita’s CodecPipelineError', async () => {
+  const metaId = freshMetaId()
+  await handleCodecMessage({
+    type: 'init',
+    id: 12,
+    metaId,
+    meta: {
+      ...BYTES_META,
+      codecs: [...BYTES_META.codecs, { name: 'zstd', configuration: { level: 1 } }],
+    },
+  })
+
+  const reply = await handleCodecMessage({
+    type: 'decode',
+    id: 13,
+    bytes: Uint8Array.from([1, 2, 3, 4, 5, 6, 7, 8]).buffer,
+    metaId,
+  })
+  assert.equal(reply.response.type, 'decoded')
+  const { errorInfo } = reply.response
+  assert.equal(errorInfo.tag, 'CodecPipelineError')
+  assert.equal(errorInfo.codec, 'zstd')
+  assert.equal(errorInfo.direction, 'decode')
+  assert.equal(typeof errorInfo.cause, 'string')
+  // The message names the codec and says what went wrong inside it.
+  assert.match(reply.response.error, /decode chunk via codec "zstd": ./)
+})
+
+test('encode honours the stride the chunk is laid out in', async () => {
+  const metaId = freshMetaId()
+  await handleCodecMessage({
+    type: 'init',
+    id: 14,
+    metaId,
+    meta: {
+      ...BYTES_META,
+      codecs: [
+        { name: 'transpose', configuration: { order: [1, 0] } },
+        ...BYTES_META.codecs,
+      ],
+    },
+  })
+
+  // The 2x2 matrix [[1, 2], [3, 4]], once in C order and once already in the
+  // transposed (column-major) layout the codec stores: both must encode to
+  // the same bytes.
+  const encode = async (values, stride) =>
+    new Int32Array(
+      (
+        await handleCodecMessage({
+          type: 'encode',
+          id: 15,
+          data: Int32Array.from(values).buffer,
+          metaId,
+          stride,
+        })
+      ).response.bytes,
+    )
+  const fromC = await encode([1, 2, 3, 4], undefined)
+  const fromF = await encode([1, 3, 2, 4], [1, 2])
+  assert.deepEqual(Array.from(fromC), [1, 3, 2, 4])
+  assert.deepEqual(Array.from(fromF), Array.from(fromC))
 })
 
 test('the node worker entry refuses to run on the main thread', async () => {
